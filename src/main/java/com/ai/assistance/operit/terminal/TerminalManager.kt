@@ -86,6 +86,8 @@ class TerminalManager private constructor(
     
     // 单例的 TerminalProvider
     private var terminalProvider: TerminalProvider? = null
+    private var localTerminalProvider: TerminalProvider? = null
+    private val sessionProviders = ConcurrentHashMap<String, TerminalProvider>()
     private val providerMutex = Mutex()
 
     // 状态和事件流
@@ -153,16 +155,18 @@ class TerminalManager private constructor(
      * @param title 会话标题
      */
     suspend fun createNewSession(
-        title: String? = null
+        title: String? = null,
+        terminalTypeOverride: TerminalType? = null,
+        makeCurrent: Boolean = true
     ): TerminalSessionData {
         // 自动检测终端类型
-        val terminalType = if (sshConfigManager.getConfig() != null && sshConfigManager.isEnabled()) {
+        val terminalType = terminalTypeOverride ?: if (sshConfigManager.getConfig() != null && sshConfigManager.isEnabled()) {
             TerminalType.SSH
         } else {
             TerminalType.LOCAL
         }
         
-        val newSession = sessionManager.createNewSession(title, terminalType)
+        val newSession = sessionManager.createNewSession(title, terminalType, makeCurrent)
 
         // 异步初始化会话
         coroutineScope.launch {
@@ -436,12 +440,14 @@ class TerminalManager private constructor(
                 Log.d(TAG, "Starting session...")
                 closingSessions.remove(sessionId)
 
-                // 获取单例的终端提供者
-                val provider = getTerminalProvider()
+                val session = sessionManager.getSession(sessionId)
+                    ?: throw IllegalStateException("Session not found: $sessionId")
+                val provider = getTerminalProvider(session.terminalType)
 
                 // 启动终端会话
                 val result = provider.startSession(sessionId)
                 val (terminalSession, pty) = result.getOrThrow()
+                sessionProviders[sessionId] = provider
                 val sessionWriter = terminalSession.stdin.writer()
 
                 // 启动读取协程
@@ -530,6 +536,20 @@ class TerminalManager private constructor(
             }
         }
         return terminalProvider!!
+    }
+
+    private suspend fun getTerminalProvider(terminalType: TerminalType): TerminalProvider {
+        if (terminalType != TerminalType.LOCAL) return getTerminalProvider()
+        providerMutex.withLock {
+            val existingDefault = terminalProvider
+            if (existingDefault is LocalTerminalProvider) return existingDefault
+            if (localTerminalProvider == null) {
+                localTerminalProvider = LocalTerminalProvider(context).also { provider ->
+                    provider.connect().getOrThrow()
+                }
+            }
+            return localTerminalProvider!!
+        }
     }
 
     suspend fun initializeEnvironment(): Boolean {
@@ -1293,7 +1313,8 @@ $prootBindSetup
         // Delegate to provider to ensure underlying process is killed
         coroutineScope.launch {
             try {
-                terminalProvider?.closeSession(sessionId)
+                sessionProviders.remove(sessionId)?.closeSession(sessionId)
+                    ?: terminalProvider?.closeSession(sessionId)
             } catch (e: Exception) {
                 Log.e(TAG, "Error closing session via provider", e)
             }
@@ -1337,12 +1358,17 @@ $prootBindSetup
         kotlinx.coroutines.runBlocking {
             terminalProvider?.disconnect()
             Log.d(TAG, "Disconnected terminal provider")
+            if (localTerminalProvider !== terminalProvider) {
+                localTerminalProvider?.disconnect()
+            }
             
             // 停止SSHD服务器
             sshdServerManager.stopServer()
             Log.d(TAG, "Stopped SSHD server")
         }
         terminalProvider = null
+        localTerminalProvider = null
+        sessionProviders.clear()
         
         activeSessions.keys.toList().forEach { sessionId ->
             closeTerminalSession(sessionId)

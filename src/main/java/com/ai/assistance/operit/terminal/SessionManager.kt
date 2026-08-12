@@ -26,7 +26,8 @@ class SessionManager(private val terminalManager: TerminalManager) {
      */
     fun createNewSession(
         title: String? = null,
-        terminalType: TerminalType
+        terminalType: TerminalType,
+        makeCurrent: Boolean = true
     ): TerminalSessionData {
         lateinit var newSession: TerminalSessionData
         _state.update { currentState ->
@@ -42,7 +43,7 @@ class SessionManager(private val terminalManager: TerminalManager) {
             )
             currentState.copy(
                 sessions = currentState.sessions + newSession,
-                currentSessionId = newSession.id
+                currentSessionId = if (makeCurrent) newSession.id else currentState.currentSessionId
             )
         }
         
