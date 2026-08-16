@@ -2,6 +2,7 @@ package com.ai.assistance.operit.terminal
 
 import android.content.Context
 import android.util.Log
+import android.system.Os
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -48,6 +49,20 @@ import com.ai.assistance.operit.terminal.provider.type.LocalTerminalProvider
 import com.ai.assistance.operit.terminal.provider.type.SSHTerminalProvider
 import com.ai.assistance.operit.terminal.data.TerminalSessionData
 import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiTerminalEmulator
+
+class TerminalSessionCleanupPendingException(
+    val sessionId: String,
+    message: String,
+) : Exception(message)
+
+class TerminalSessionCleanupPendingCancellationException(
+    val sessionId: String,
+    cause: CancellationException,
+) : CancellationException(cause.message) {
+    init {
+        initCause(cause)
+    }
+}
 
 class TerminalManager private constructor(
     private val context: Context
@@ -132,6 +147,8 @@ class TerminalManager private constructor(
         private const val MAX_HISTORY_ITEMS = 500
         private const val MAX_OUTPUT_LINES_PER_ITEM = 1000
         private const val TERMINAL_ENTER = "\r"
+        private const val SESSION_INITIALIZATION_TIMEOUT_MS = 30_000L
+        private const val SESSION_CLOSE_TIMEOUT_MS = 3_000L
     }
 
     init {
@@ -183,21 +200,29 @@ class TerminalManager private constructor(
 
         // 等待会话初始化完成
         val success = try {
-            withTimeoutOrNull(30000) { // 30秒超时
+            withTimeoutOrNull(SESSION_INITIALIZATION_TIMEOUT_MS) {
                 terminalState.first { state ->
                     val session = state.sessions.find { it.id == newSession.id }
                     session?.initState == com.ai.assistance.operit.terminal.data.SessionInitState.READY
                 }
             }
         } catch (cancelled: CancellationException) {
-            sessionManager.closeSession(newSession.id)
+            val terminated = closeSessionAndAwait(newSession.id, SESSION_CLOSE_TIMEOUT_MS)
+            if (!terminated) {
+                throw TerminalSessionCleanupPendingCancellationException(newSession.id, cancelled)
+            }
             throw cancelled
         }
 
         if (success == null) {
             Log.e(TAG, "Session initialization timeout for session: ${newSession.id}")
-            // 初始化失败，移除会话
-            sessionManager.closeSession(newSession.id)
+            val terminated = closeSessionAndAwait(newSession.id, SESSION_CLOSE_TIMEOUT_MS)
+            if (!terminated) {
+                throw TerminalSessionCleanupPendingException(
+                    newSession.id,
+                    "Session initialization timeout; cleanup is still pending",
+                )
+            }
             throw Exception("Session initialization timeout")
         }
 
@@ -619,23 +644,18 @@ class TerminalManager private constructor(
     }
 
     suspend fun initializeEnvironment(): Boolean {
-        if (isEnvInitialized) {
-            return withContext(Dispatchers.IO) {
-                try {
-                    val startScript = generateStartScript()
-                    File(filesDir, "common.sh").writeText(startScript.replace("\r\n", "\n").replace("\r", "\n"))
-                    true
-                } catch (e: Exception) {
-                    Log.e(TAG, "Environment script refresh failed", e)
-                    false
-                }
-            }
-        }
-
         envInitMutex.lock()
         try {
             if (isEnvInitialized) {
-                return true
+                return withContext(Dispatchers.IO) {
+                    try {
+                        writeStartScriptAtomically()
+                        true
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Environment script refresh failed", e)
+                        false
+                    }
+                }
             }
 
             val success = withContext(Dispatchers.IO) {
@@ -653,8 +673,7 @@ class TerminalManager private constructor(
                     extractAssets()
 
                     // 4. Generate and write startup script
-                    val startScript = generateStartScript()
-                    File(filesDir, "common.sh").writeText(startScript.replace("\r\n", "\n").replace("\r", "\n"))
+                    writeStartScriptAtomically()
 
 
                     Log.d(TAG, "Environment initialization completed successfully.")
@@ -1393,6 +1412,22 @@ $prootBindSetup
             session.process.destroy()
             activeSessions.remove(sessionId)
             Log.d(TAG, "Closed and removed session: $sessionId")
+        }
+    }
+
+    private fun writeStartScriptAtomically() {
+        val contents = generateStartScript().replace("\r\n", "\n").replace("\r", "\n")
+        val target = File(filesDir, "common.sh")
+        val staged = File.createTempFile("common.sh.", ".pending", filesDir)
+        try {
+            staged.outputStream().use { output ->
+                output.write(contents.toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            // Same-directory POSIX rename is atomic for readers that source common.sh directly.
+            Os.rename(staged.absolutePath, target.absolutePath)
+        } finally {
+            staged.delete()
         }
     }
 
