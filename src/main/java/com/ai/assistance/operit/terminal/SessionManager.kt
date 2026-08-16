@@ -75,21 +75,28 @@ class SessionManager(private val terminalManager: TerminalManager) {
     /**
      * 关闭会话
      */
-    fun closeSession(sessionId: String) {
-        _state.update { currentState ->
-            val sessionToClose = currentState.sessions.find { it.id == sessionId }
-            
-            sessionToClose?.let { session ->
-                try {
-                    // 清理资源
-                    session.readJob?.cancel()
-                    session.sessionWriter?.close()
-                    terminalManager.closeTerminalSession(session.id)
-                } catch (e: Exception) {
-                    Log.e("SessionManager", "Error cleaning up session", e)
-                }
+    fun closeSession(sessionId: String): Boolean {
+        val sessionToClose = takeSession(sessionId)
+        sessionToClose?.let { session ->
+            try {
+                session.readJob?.cancel()
+                session.sessionWriter?.close()
+                terminalManager.closeTerminalSession(session.id)
+            } catch (e: Exception) {
+                Log.e("SessionManager", "Error cleaning up session", e)
             }
-            
+        }
+
+        terminalManager.onSessionClosed(sessionId)
+        Log.d("SessionManager", "Closed session: $sessionId")
+        return sessionToClose != null
+    }
+
+    /** Atomically claim a visible session for closing so concurrent close callers are ordered. */
+    private fun takeSession(sessionId: String): TerminalSessionData? {
+        while (true) {
+            val currentState = _state.value
+            val sessionToClose = currentState.sessions.find { it.id == sessionId } ?: return null
             val updatedSessions = currentState.sessions.filter { it.id != sessionId }
             val newCurrentSessionId = if (currentState.currentSessionId == sessionId) {
                 updatedSessions.firstOrNull()?.id
@@ -97,15 +104,12 @@ class SessionManager(private val terminalManager: TerminalManager) {
                 currentState.currentSessionId
             }
             
-            currentState.copy(
+            val updatedState = currentState.copy(
                 sessions = updatedSessions,
                 currentSessionId = newCurrentSessionId
             )
+            if (_state.compareAndSet(currentState, updatedState)) return sessionToClose
         }
-
-        terminalManager.onSessionClosed(sessionId)
-        
-        Log.d("SessionManager", "Closed session: $sessionId")
     }
     
     /**

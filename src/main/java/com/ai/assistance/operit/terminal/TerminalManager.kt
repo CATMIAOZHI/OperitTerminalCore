@@ -64,6 +64,12 @@ class TerminalSessionCleanupPendingCancellationException(
     }
 }
 
+enum class TerminalSessionCloseOutcome {
+    CLOSED,
+    ALREADY_CLOSED,
+    TERMINATION_TIMEOUT,
+}
+
 class TerminalManager private constructor(
     private val context: Context
 ) {
@@ -246,15 +252,26 @@ class TerminalManager private constructor(
 
     /** Close a session and wait until its current process has actually exited. */
     suspend fun closeSessionAndAwait(sessionId: String, timeoutMs: Long): Boolean {
+        return closeSessionWithOutcomeAndAwait(sessionId, timeoutMs) !=
+            TerminalSessionCloseOutcome.TERMINATION_TIMEOUT
+    }
+
+    /**
+     * Atomically claim a visible session for manager-initiated close and report whether another
+     * caller (notably the terminal UI) had already closed it.
+     */
+    suspend fun closeSessionWithOutcomeAndAwait(
+        sessionId: String,
+        timeoutMs: Long,
+    ): TerminalSessionCloseOutcome {
         val startup = sessionStartups[sessionId]
         val publishedProcess =
             sessionProcesses[sessionId] ?: sessionManager.getSession(sessionId)?.terminalSession?.process
-        if (sessionManager.getSession(sessionId) != null) {
-            sessionManager.closeSession(sessionId)
-        } else {
+        val wasPresent = sessionManager.closeSession(sessionId)
+        if (!wasPresent) {
             closeTerminalSession(sessionId)
         }
-        return withContext(Dispatchers.IO + NonCancellable) {
+        val terminated = withContext(Dispatchers.IO + NonCancellable) {
             withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
                 val process = publishedProcess ?: startup?.await() ?: sessionProcesses[sessionId]
                 process?.destroy()
@@ -265,6 +282,11 @@ class TerminalManager private constructor(
                 }
                 true
             } ?: false
+        }
+        return when {
+            !terminated -> TerminalSessionCloseOutcome.TERMINATION_TIMEOUT
+            wasPresent -> TerminalSessionCloseOutcome.CLOSED
+            else -> TerminalSessionCloseOutcome.ALREADY_CLOSED
         }
     }
 
