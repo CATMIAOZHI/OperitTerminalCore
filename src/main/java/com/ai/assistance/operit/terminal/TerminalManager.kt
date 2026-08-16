@@ -23,6 +23,11 @@ import com.ai.assistance.operit.terminal.view.domain.OutputProcessor
 import java.util.UUID
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
@@ -57,6 +62,9 @@ class TerminalManager private constructor(
     private val nativeLibDir: String = context.applicationInfo.nativeLibraryDir
     private val activeSessions = ConcurrentHashMap<String, TerminalSession>()
     private val closingSessions = ConcurrentHashMap.newKeySet<String>()
+    private val sessionProcesses = ConcurrentHashMap<String, Process>()
+    private val sessionStartups = ConcurrentHashMap<String, CompletableDeferred<Process?>>()
+    private val processReapJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
     
     // SharedPreferences for reading settings
     private val prefs = context.getSharedPreferences("terminal_settings", Context.MODE_PRIVATE)
@@ -167,18 +175,23 @@ class TerminalManager private constructor(
         }
         
         val newSession = sessionManager.createNewSession(title, terminalType, makeCurrent)
+        val startup = CompletableDeferred<Process?>()
+        sessionStartups[newSession.id] = startup
 
         // 异步初始化会话
-        coroutineScope.launch {
-            initializeSession(newSession.id)
-        }
+        initializeSession(newSession.id, startup)
 
         // 等待会话初始化完成
-        val success = withTimeoutOrNull(30000) { // 30秒超时
-            terminalState.first { state ->
-                val session = state.sessions.find { it.id == newSession.id }
-                session?.initState == com.ai.assistance.operit.terminal.data.SessionInitState.READY
+        val success = try {
+            withTimeoutOrNull(30000) { // 30秒超时
+                terminalState.first { state ->
+                    val session = state.sessions.find { it.id == newSession.id }
+                    session?.initState == com.ai.assistance.operit.terminal.data.SessionInitState.READY
+                }
             }
+        } catch (cancelled: CancellationException) {
+            sessionManager.closeSession(newSession.id)
+            throw cancelled
         }
 
         if (success == null) {
@@ -204,6 +217,30 @@ class TerminalManager private constructor(
      */
     fun closeSession(sessionId: String) {
         sessionManager.closeSession(sessionId)
+    }
+
+    /** Close a session and wait until its current process has actually exited. */
+    suspend fun closeSessionAndAwait(sessionId: String, timeoutMs: Long): Boolean {
+        val startup = sessionStartups[sessionId]
+        val publishedProcess =
+            sessionProcesses[sessionId] ?: sessionManager.getSession(sessionId)?.terminalSession?.process
+        if (sessionManager.getSession(sessionId) != null) {
+            sessionManager.closeSession(sessionId)
+        } else {
+            closeTerminalSession(sessionId)
+        }
+        return withContext(Dispatchers.IO + NonCancellable) {
+            withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
+                val process = publishedProcess ?: startup?.await() ?: sessionProcesses[sessionId]
+                process?.destroy()
+                while (process?.isAlive == true) delay(25L)
+                if (process != null) {
+                    sessionProcesses.remove(sessionId, process)
+                    processReapJobs.remove(sessionId)?.cancel()
+                }
+                true
+            } ?: false
+        }
     }
 
     /**
@@ -425,29 +462,49 @@ class TerminalManager private constructor(
         }
     }
 
-    private fun initializeSession(sessionId: String) {
+    private fun initializeSession(sessionId: String, startup: CompletableDeferred<Process?>) {
         coroutineScope.launch {
             val success = initializeEnvironment()
             if (success) {
-                startSession(sessionId)
+                startSession(sessionId, startup)
+            } else {
+                closingSessions.remove(sessionId)
+                startup.complete(null)
+                sessionStartups.remove(sessionId, startup)
             }
         }
     }
 
-    private fun startSession(sessionId: String) {
+    private fun startSession(sessionId: String, startup: CompletableDeferred<Process?>) {
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 Log.d(TAG, "Starting session...")
-                closingSessions.remove(sessionId)
-
-                val session = sessionManager.getSession(sessionId)
-                    ?: throw IllegalStateException("Session not found: $sessionId")
+                if (closingSessions.contains(sessionId)) {
+                    closingSessions.remove(sessionId)
+                    startup.complete(null)
+                    return@launch
+                }
+                val session = sessionManager.getSession(sessionId) ?: run {
+                    startup.complete(null)
+                    return@launch
+                }
                 val provider = getTerminalProvider(session.terminalType)
 
                 // 启动终端会话
                 val result = provider.startSession(sessionId)
                 val (terminalSession, pty) = result.getOrThrow()
                 sessionProviders[sessionId] = provider
+                sessionProcesses[sessionId] = terminalSession.process
+                startup.complete(terminalSession.process)
+                if (closingSessions.contains(sessionId) || sessionManager.getSession(sessionId) == null) {
+                    try {
+                        provider.closeSession(sessionId)
+                    } finally {
+                        destroyAndReapSessionProcess(sessionId, terminalSession.process)
+                    }
+                    closingSessions.remove(sessionId)
+                    return@launch
+                }
                 val sessionWriter = terminalSession.stdin.writer()
 
                 // 启动读取协程
@@ -488,7 +545,16 @@ class TerminalManager private constructor(
                     )
                 }
             } catch (e: Exception) {
+                startup.complete(sessionProcesses[sessionId])
+                if (sessionManager.getSession(sessionId) == null) {
+                    sessionProcesses[sessionId]?.let { process ->
+                        destroyAndReapSessionProcess(sessionId, process)
+                    }
+                    closingSessions.remove(sessionId)
+                }
                 Log.e(TAG, "Error starting session", e)
+            } finally {
+                sessionStartups.remove(sessionId, startup)
             }
         }
     }
@@ -1310,6 +1376,9 @@ $prootBindSetup
 
     fun closeTerminalSession(sessionId: String) {
         closingSessions.add(sessionId)
+        sessionProcesses[sessionId]?.let { process ->
+            destroyAndReapSessionProcess(sessionId, process)
+        }
         // Delegate to provider to ensure underlying process is killed
         coroutineScope.launch {
             try {
@@ -1325,6 +1394,21 @@ $prootBindSetup
             activeSessions.remove(sessionId)
             Log.d(TAG, "Closed and removed session: $sessionId")
         }
+    }
+
+    private fun destroyAndReapSessionProcess(sessionId: String, process: Process) {
+        process.destroy()
+        lateinit var reapJob: kotlinx.coroutines.Job
+        reapJob = coroutineScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                while (process.isAlive) delay(25L)
+                sessionProcesses.remove(sessionId, process)
+            } finally {
+                processReapJobs.remove(sessionId, reapJob)
+            }
+        }
+        if (processReapJobs.putIfAbsent(sessionId, reapJob) == null) reapJob.start()
+        else reapJob.cancel()
     }
 
     private fun handleRegularCommand(command: String, session: com.ai.assistance.operit.terminal.data.TerminalSessionData, commandId: String) {
