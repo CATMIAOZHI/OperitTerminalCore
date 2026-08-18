@@ -1,6 +1,9 @@
 package com.ai.assistance.operit.terminal
 
 import android.util.Log
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import java.io.File
 import java.io.FileDescriptor
 import java.io.FileInputStream
@@ -8,6 +11,17 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+
+internal enum class PtyProcessProbeResult {
+    ALIVE,
+    DEAD,
+}
+
+internal fun ptyProcessExitValue(probeResult: PtyProcessProbeResult): Int =
+    when (probeResult) {
+        PtyProcessProbeResult.DEAD -> 0
+        PtyProcessProbeResult.ALIVE -> throw IllegalThreadStateException("Process hasn't exited")
+    }
 
 open class Pty(
     val process: Process,
@@ -86,21 +100,21 @@ open class Pty(
                 }
 
                 override fun exitValue(): Int {
-                    // We can't get the actual exit value without a blocking waitpid call,
-                    // which we do in waitFor(). The contract of exitValue() is to throw
-                    // an exception if the process is still running.
-                    try {
-                        // sendSignal(pid, 0) checks if the process exists.
-                        // If it doesn't throw, the process is still alive.
-                        android.os.Process.sendSignal(pid, 0)
-                        throw IllegalThreadStateException("Process hasn't exited")
-                    } catch (e: Exception) {
-                        // The process is dead. We don't have the exit code without waiting,
-                        // so we can't fulfill the contract perfectly. Returning 0 is a
-                        // reasonable fallback for a terminated process where the specific
-                        // exit code isn't available.
-                        return 0
-                    }
+                    val probeResult =
+                        try {
+                            Os.kill(pid, 0)
+                            PtyProcessProbeResult.ALIVE
+                        } catch (error: ErrnoException) {
+                            if (error.errno == OsConstants.ESRCH) {
+                                PtyProcessProbeResult.DEAD
+                            } else {
+                                // Permission and transient probe failures do not establish that
+                                // the child exited. Treat them as alive to avoid killing a valid
+                                // PTY session through Process.isAlive's false path.
+                                PtyProcessProbeResult.ALIVE
+                            }
+                        }
+                    return ptyProcessExitValue(probeResult)
                 }
 
                 override fun getErrorStream(): InputStream? = null
@@ -234,4 +248,4 @@ object Reflect {
         }
         return fileDescriptor
     }
-} 
+}

@@ -94,6 +94,7 @@ dependencies {
     implementation(libs.coroutines.core)
     implementation(libs.coroutines.android)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    testImplementation(libs.junit)
     
     // Kotlin Serialization
     implementation(libs.kotlinx.serialization)
