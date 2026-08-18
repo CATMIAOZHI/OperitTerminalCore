@@ -509,6 +509,11 @@ class TerminalManager private constructor(
             message = context.getString(R.string.terminal_exited_with_code, exitCode),
             sessionManager = sessionManager
         )
+
+        // 已退出的会话不能继续留在状态表中，否则同名 terminal.create 会复用已关闭的 PTY，
+        // 后续命令只会写入失效 writer 并等待一个永远不会到达的完成事件。下一次按名称创建时，
+        // 会话管理器会启动新的会话。
+        sessionManager.closeSession(sessionId)
     }
     
     /**
