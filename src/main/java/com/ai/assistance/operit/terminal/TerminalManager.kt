@@ -188,7 +188,8 @@ class TerminalManager private constructor(
     suspend fun createNewSession(
         title: String? = null,
         terminalTypeOverride: TerminalType? = null,
-        makeCurrent: Boolean = true
+        makeCurrent: Boolean = true,
+        automation: Boolean = false
     ): TerminalSessionData {
         // 自动检测终端类型
         val terminalType = terminalTypeOverride ?: if (sshConfigManager.getConfig() != null && sshConfigManager.isEnabled()) {
@@ -197,7 +198,7 @@ class TerminalManager private constructor(
             TerminalType.LOCAL
         }
         
-        val newSession = sessionManager.createNewSession(title, terminalType, makeCurrent)
+        val newSession = sessionManager.createNewSession(title, terminalType, makeCurrent, automation)
         val startup = CompletableDeferred<Process?>()
         sessionStartups[newSession.id] = startup
 
@@ -296,6 +297,70 @@ class TerminalManager private constructor(
     fun onSessionClosed(sessionId: String) {
         outputProcessor.clearSessionState(sessionId)
     }
+
+    internal fun finishClosedSession(session: TerminalSessionData) {
+        outputProcessor.finishClosedSession(session, context.getString(R.string.terminal_exited_with_code, -1))
+    }
+
+    /** A queued timeout must never interrupt the command currently owning the PTY. */
+    suspend fun cancelCommand(sessionId: String, commandId: String, settleMs: Long = 3_000L) {
+        withContext(Dispatchers.IO + NonCancellable) {
+            val original = sessionManager.getSession(sessionId) ?: return@withContext
+            val wasQueued = synchronized(original.commandLifecycle) {
+                val session = sessionManager.getSession(sessionId) ?: return@synchronized false
+                if (session.commandQueue.removeAll { it.id == commandId }) {
+                    coroutineScope.launch {
+                        _commandExecutionEvents.emit(CommandExecutionEvent(
+                            commandId, sessionId, "", true, "cancelled"
+                        ))
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            if (wasQueued) return@withContext
+            original.commandLifecycle.cancellationMutex.withLock {
+                val running = synchronized(original.commandLifecycle) {
+                    val session = sessionManager.getSession(sessionId) ?: return@synchronized false
+                    if (session.commandLifecycle.closed) return@synchronized false
+                    val current = session.currentExecutingCommand
+                    if (current?.id != commandId || !current.isExecuting) return@synchronized false
+                    // Stop queue advancement before sending Ctrl+C. Do not let a delayed cancellation
+                    // close the next command after the prompt returns.
+                    session.commandLifecycle.cancellingCommandId = commandId
+                    runCatching { writeInputToKernel(session, "\u0003", "command-cancel") }
+                    true
+                }
+                if (!running) return@withContext
+                val settled = withTimeoutOrNull(settleMs) {
+                    while (true) {
+                        val done = synchronized(original.commandLifecycle) {
+                            val current = sessionManager.getSession(sessionId)?.currentExecutingCommand
+                            current?.id != commandId || !current.isExecuting
+                        }
+                        if (done) break
+                        delay(25)
+                    }
+                    true
+                } == true
+                if (!settled) {
+                    // Keep admission/queue advancement blocked throughout process teardown.
+                    val pty = sessionManager.getSession(sessionId)?.pty
+                    val cleaned = runCatching { pty?.terminateSession(2_000L) == true }
+                        .onFailure { Log.w(TAG, "Session process cleanup failed: $sessionId", it) }
+                        .getOrDefault(false)
+                    if (!cleaned) Log.w(TAG, "Session process cleanup incomplete: $sessionId")
+                    closeSessionAndAwait(sessionId, 2_000L)
+                } else {
+                    synchronized(original.commandLifecycle) {
+                        original.commandLifecycle.cancellingCommandId = null
+                    }
+                    processNextQueuedCommand(sessionId)
+                }
+            }
+        }
+    }
     
     /**
      * 保存会话的滚动位置
@@ -384,8 +449,10 @@ class TerminalManager private constructor(
             return actualCommandId
         }
 
-        session.commandMutex.withLock {
-            if (session.currentExecutingCommand?.isExecuting == true) {
+        synchronized(session.commandLifecycle) {
+            val session = sessionManager.getSession(session.id) ?: return actualCommandId
+            if (session.commandLifecycle.closed) return actualCommandId
+            if (session.currentExecutingCommand?.isExecuting == true || session.commandLifecycle.cancellingCommandId != null) {
                 // 有命令正在执行，将新命令加入队列
                 session.commandQueue.add(QueuedCommand(actualCommandId, command))
                 Log.d(TAG, "Command queued: $command (id: $actualCommandId). Queue size: ${session.commandQueue.size}")
@@ -402,21 +469,13 @@ class TerminalManager private constructor(
      */
     suspend fun sendCommandToSession(sessionId: String, command: String, commandId: String? = null): String {
         val actualCommandId = commandId ?: UUID.randomUUID().toString()
-        val session = sessionManager.getSession(sessionId) ?: return actualCommandId
+        val original = sessionManager.getSession(sessionId) ?: error("Terminal session is closed")
 
-        // 如果会话在交互模式，直接发送输入（不创建命令历史）
-        if (session.isInteractiveMode) {
-            Log.d(TAG, "Session $sessionId in interactive mode, sending as input: $command")
-            try {
-                writeInputToKernel(session, command + TERMINAL_ENTER, "interactive-session-command")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error sending input to session $sessionId", e)
-            }
-            return actualCommandId
-        }
-
-        session.commandMutex.withLock {
-            if (session.currentExecutingCommand?.isExecuting == true) {
+        synchronized(original.commandLifecycle) {
+            val session = sessionManager.getSession(sessionId) ?: error("Terminal session is closed")
+            check(!session.commandLifecycle.closed) { "Terminal session is closed" }
+            // Tool commands always queue; interactive keystrokes have their own input API.
+            if (session.currentExecutingCommand?.isExecuting == true || session.commandLifecycle.cancellingCommandId != null) {
                 // 有命令正在执行，将新命令加入队列
                 session.commandQueue.add(QueuedCommand(actualCommandId, command))
                 Log.d(TAG, "Command queued for session $sessionId: $command (id: $actualCommandId). Queue size: ${session.commandQueue.size}")
@@ -434,10 +493,12 @@ class TerminalManager private constructor(
     private suspend fun processNextQueuedCommand(sessionId: String) {
         val session = sessionManager.getSession(sessionId) ?: return
 
-        session.commandMutex.withLock {
+        synchronized(session.commandLifecycle) {
+            val session = sessionManager.getSession(sessionId) ?: return
+            if (session.commandLifecycle.closed || session.commandLifecycle.cancellingCommandId != null) return
             if (session.currentExecutingCommand?.isExecuting == true) {
                 Log.w(TAG, "processNextQueuedCommand called, but a command is still executing. This should not happen.")
-                return@withLock
+                return@synchronized
             }
 
             if (session.commandQueue.isNotEmpty()) {
@@ -449,16 +510,9 @@ class TerminalManager private constructor(
     }
 
     /**
-     * 内部执行命令的函数, 必须在 commandMutex 锁内部调用
+     * 内部执行命令的函数, 必须在 commandLifecycle 锁内部调用
      */
-    private suspend fun executeCommandInternal(command: String, session: TerminalSessionData, commandId: String) {
-        if (command.trim() == "clear") {
-            try {
-                writeInputToKernel(session, "clear$TERMINAL_ENTER", "command-clear")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error sending 'clear' command", e)
-            }
-        } else {
+    private fun executeCommandInternal(command: String, session: TerminalSessionData, commandId: String) {
             handleRegularCommand(command, session, commandId)
             try {
                 val fullInput = "$command$TERMINAL_ENTER"
@@ -466,16 +520,17 @@ class TerminalManager private constructor(
                 Log.d(TAG, "Sent command to PTY: $command")
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending command", e)
+                finishClosedSession(session)
+                closeSession(session.id)
             }
-        }
     }
 
     /**
      * 发送输入
      */
-    fun sendInput(input: String) {
+    fun sendInput(input: String, sessionId: String? = sessionManager.getCurrentSession()?.id) {
         coroutineScope.launch(Dispatchers.IO) {
-            val session = sessionManager.getCurrentSession() ?: return@launch
+            val session = sessionId?.let { sessionManager.getSession(it) } ?: return@launch
 
             try {
                 writeInputToKernel(session, input, "direct-input")
@@ -495,10 +550,10 @@ class TerminalManager private constructor(
     /**
      * 发送中断信号
      */
-    fun sendInterruptSignal() {
+    fun sendInterruptSignal(sessionId: String? = sessionManager.getCurrentSession()?.id) {
         coroutineScope.launch(Dispatchers.IO) {
             try {
-                val currentSession = sessionManager.getCurrentSession()
+                val currentSession = sessionId?.let { sessionManager.getSession(it) }
                 currentSession?.let {
                     writeInputToKernel(it, "\u0003", "interrupt")
                     Log.d(TAG, "Sent interrupt signal (Ctrl+C) to session ${it.id}")
@@ -538,7 +593,9 @@ class TerminalManager private constructor(
                 val provider = getTerminalProvider(session.terminalType)
 
                 // 启动终端会话
-                val result = provider.startSession(sessionId)
+                val result = if (session.automation && provider is LocalTerminalProvider) {
+                    provider.startAutomationSession(sessionId)
+                } else provider.startSession(sessionId)
                 val (terminalSession, pty) = result.getOrThrow()
                 sessionProviders[sessionId] = provider
                 sessionProcesses[sessionId] = terminalSession.process
@@ -564,7 +621,11 @@ class TerminalManager private constructor(
                             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                                 val chunk = String(buffer, 0, bytesRead)
                                 Log.d(TAG, "Read chunk: '$chunk'")
-                                outputProcessor.processOutput(sessionId, chunk, sessionManager)
+                                synchronized(session.commandLifecycle) {
+                                    if (!session.commandLifecycle.closed) {
+                                        outputProcessor.processOutput(sessionId, chunk, sessionManager)
+                                    }
+                                }
                             }
                             reachedEof = true
                         }
@@ -623,11 +684,14 @@ class TerminalManager private constructor(
             }
 
         Log.i(TAG, "Terminal session $sessionId exited with code $exitCode")
-        outputProcessor.handleSessionExit(
+        val session = sessionManager.getSession(sessionId) ?: return
+        synchronized(session.commandLifecycle) {
+          outputProcessor.handleSessionExit(
             sessionId = sessionId,
             message = context.getString(R.string.terminal_exited_with_code, exitCode),
             sessionManager = sessionManager
-        )
+          )
+        }
     }
     
     /**
@@ -1300,6 +1364,10 @@ EOF
         OPERIT_UID="$5"
         OPERIT_GID="$6"
         OPERIT_GROUPS="$7"
+        AUTOMATION_ENV=""
+        if [ "$8" = "1" ]; then
+          AUTOMATION_ENV="PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0"
+        fi
         cleanup_mounts(){
           "${'$'}BIN/busybox" umount "${'$'}UBUNTU_PATH/dev/pts" 2>/dev/null || true
           "${'$'}BIN/busybox" umount "${'$'}UBUNTU_PATH/dev" 2>/dev/null || true
@@ -1324,13 +1392,13 @@ EOF
         "${'$'}BIN/busybox" mount --bind /data/local/tmp "${'$'}UBUNTU_PATH/data/local/tmp" 2>/dev/null || true
         "${'$'}BIN/busybox" mount --bind "${'$'}HOME_DIR" "${'$'}UBUNTU_PATH${'$'}HOME_DIR" 2>/dev/null || true
         COMMAND_TO_EXEC="$(cat "${'$'}CMD_FILE" 2>/dev/null)"
-        "${'$'}BIN/busybox" chroot "${'$'}UBUNTU_PATH" /usr/bin/env -i HOME=/root TERM=xterm-256color LANG=en_US.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "COMMAND_TO_EXEC=${'$'}COMMAND_TO_EXEC" "OPERIT_UID=${'$'}OPERIT_UID" "OPERIT_GID=${'$'}OPERIT_GID" "OPERIT_GROUPS=${'$'}OPERIT_GROUPS" /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; umask 0002; if [ -n "${'$'}OPERIT_GID" ]; then chown 0:"${'$'}OPERIT_GID" /root 2>/dev/null || true; chmod 2775 /root 2>/dev/null || true; fi; eval "${'$'}COMMAND_TO_EXEC"'
+        "${'$'}BIN/busybox" chroot "${'$'}UBUNTU_PATH" /usr/bin/env -i ${'$'}AUTOMATION_ENV HOME=/root TERM=xterm-256color LANG=en_US.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "COMMAND_TO_EXEC=${'$'}COMMAND_TO_EXEC" "OPERIT_UID=${'$'}OPERIT_UID" "OPERIT_GID=${'$'}OPERIT_GID" "OPERIT_GROUPS=${'$'}OPERIT_GROUPS" /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; umask 0002; if [ -n "${'$'}OPERIT_GID" ]; then chown 0:"${'$'}OPERIT_GID" /root 2>/dev/null || true; chmod 2775 /root 2>/dev/null || true; fi; eval "${'$'}COMMAND_TO_EXEC"'
         ret=${'$'}?
         cleanup_mounts
         exit ${'$'}ret
         EOF
             chmod 700 "${'$'}CHROOT_WRAPPER" 2>/dev/null || true
-            exec su -c "sh \"${'$'}CHROOT_WRAPPER\" \"${'$'}BIN\" \"${'$'}UBUNTU_PATH\" \"${'$'}CMD_FILE\" \"${homeDir}\" \"${'$'}OPERIT_UID\" \"${'$'}OPERIT_GID\" \"${'$'}OPERIT_GROUPS\""
+            exec su -c "sh \"${'$'}CHROOT_WRAPPER\" \"${'$'}BIN\" \"${'$'}UBUNTU_PATH\" \"${'$'}CMD_FILE\" \"${homeDir}\" \"${'$'}OPERIT_UID\" \"${'$'}OPERIT_GID\" \"${'$'}OPERIT_GROUPS\" \"${'$'}OPERIT_AUTOMATION\""
           fi
           if ! resolve_proot_runtime; then
             return 1
@@ -1351,6 +1419,8 @@ $prootBindSetup
             set --
           fi
           if [ "${'$'}PROOT_LINK2SYMLINK" = "1" ]; then
+            AUTOMATION_ENV=""
+            if [ "${'$'}OPERIT_AUTOMATION" = "1" ]; then AUTOMATION_ENV="PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0"; fi
             exec_proot_binary \
               -0 \
               -r "${'$'}UBUNTU_PATH" \
@@ -1358,6 +1428,7 @@ $prootBindSetup
               "${'$'}@" \
               -w /root \
               /usr/bin/env -i \
+                ${'$'}AUTOMATION_ENV \
                 HOME=/root \
                 TERM=xterm-256color \
                 LANG=en_US.UTF-8 \
@@ -1365,12 +1436,15 @@ $prootBindSetup
                 COMMAND_TO_EXEC="${'$'}COMMAND_TO_EXEC" \
                 /bin/bash -lc 'echo LOGIN_SUCCESSFUL; echo TERMINAL_READY; eval "${'$'}COMMAND_TO_EXEC"'
           else
+            AUTOMATION_ENV=""
+            if [ "${'$'}OPERIT_AUTOMATION" = "1" ]; then AUTOMATION_ENV="PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0"; fi
             exec_proot_binary \
               -0 \
               -r "${'$'}UBUNTU_PATH" \
               "${'$'}@" \
               -w /root \
               /usr/bin/env -i \
+                ${'$'}AUTOMATION_ENV \
                 HOME=/root \
                 TERM=xterm-256color \
                 LANG=en_US.UTF-8 \

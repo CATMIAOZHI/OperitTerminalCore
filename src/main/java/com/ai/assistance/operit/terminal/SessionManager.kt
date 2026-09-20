@@ -27,7 +27,8 @@ class SessionManager(private val terminalManager: TerminalManager) {
     fun createNewSession(
         title: String? = null,
         terminalType: TerminalType,
-        makeCurrent: Boolean = true
+        makeCurrent: Boolean = true,
+        automation: Boolean = false
     ): TerminalSessionData {
         lateinit var newSession: TerminalSessionData
         _state.update { currentState ->
@@ -39,7 +40,8 @@ class SessionManager(private val terminalManager: TerminalManager) {
             }
             newSession = TerminalSessionData(
                 title = title ?: defaultTitle,
-                terminalType = terminalType
+                terminalType = terminalType,
+                automation = automation
             )
             currentState.copy(
                 sessions = currentState.sessions + newSession,
@@ -76,20 +78,24 @@ class SessionManager(private val terminalManager: TerminalManager) {
      * 关闭会话
      */
     fun closeSession(sessionId: String): Boolean {
-        val sessionToClose = takeSession(sessionId)
-        sessionToClose?.let { session ->
-            try {
-                session.readJob?.cancel()
-                session.sessionWriter?.close()
-                terminalManager.closeTerminalSession(session.id)
-            } catch (e: Exception) {
-                Log.e("SessionManager", "Error cleaning up session", e)
-            }
+        val existing = getSession(sessionId) ?: return false
+        val sessionToClose = synchronized(existing.commandLifecycle) {
+            val session = takeSession(sessionId) ?: return false
+            terminalManager.finishClosedSession(session)
+            session
+        }
+        try {
+            sessionToClose.readJob?.cancel()
+            sessionToClose.sessionWriter?.close()
+        } catch (e: Exception) {
+            Log.e("SessionManager", "Error cleaning up session streams", e)
+        } finally {
+            terminalManager.closeTerminalSession(sessionId)
         }
 
         terminalManager.onSessionClosed(sessionId)
         Log.d("SessionManager", "Closed session: $sessionId")
-        return sessionToClose != null
+        return true
     }
 
     /** Atomically claim a visible session for closing so concurrent close callers are ordered. */
@@ -116,15 +122,18 @@ class SessionManager(private val terminalManager: TerminalManager) {
      * 更新会话数据
      */
     fun updateSession(sessionId: String, updater: (TerminalSessionData) -> TerminalSessionData) {
-        _state.update { currentState ->
-            val updatedSessions = currentState.sessions.map { session ->
-                if (session.id == sessionId) {
-                    updater(session)
-                } else {
-                    session
+        val existing = getSession(sessionId) ?: return
+        synchronized(existing.commandLifecycle) {
+            _state.update { currentState ->
+                val updatedSessions = currentState.sessions.map { session ->
+                    if (session.id == sessionId) {
+                        updater(session)
+                    } else {
+                        session
+                    }
                 }
+                currentState.copy(sessions = updatedSessions)
             }
-            currentState.copy(sessions = updatedSessions)
         }
     }
     

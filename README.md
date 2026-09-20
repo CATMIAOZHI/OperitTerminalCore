@@ -27,4 +27,23 @@ The `terminal-core` module is responsible for the following core tasks:
 
 ## Usage
 
-This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface. 
+This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface.
+
+### Automation and cancellation
+
+`createNewSession(automation = true)` disables Git/pager prompts in local sessions
+(`PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`). Human sessions and SSH
+environments retain their defaults. This does not disable every possible interactive program.
+
+Tool commands sent through `sendCommandToSession` queue while another command is
+running; use `sendInput` for interactive keystrokes. Cancel with both `sessionId`
+and `commandId`: queued calls are removed without interrupting the current command.
+Running calls get Ctrl+C and a bounded grace period. If they do not settle, their
+local PTY session is retired (PRoot SIGQUIT, then SIGKILL for remaining session
+members). Process identities are checked before signalling. Cleanup that cannot be
+confirmed is logged; closing a local SSH client does not prove remote jobs stopped.
+
+Explicit close and process exit finish all waiting calls exactly once.
+`CommandExecutionEvent.terminationReason` is non-null for cancellation or session
+closure; clients must not interpret those events as successful command execution.
+The faulted shell is not reused and commands are not automatically retried.

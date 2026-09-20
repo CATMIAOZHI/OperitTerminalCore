@@ -30,6 +30,12 @@ open class Pty(
     val stdout: InputStream,
     val stdin: OutputStream
 ) {
+    private var sessionOwner: SessionProcessIdentity? = null
+
+    /** Retire this PTY's local process session; SSH has no local ownership guarantee. */
+    suspend fun terminateSession(timeoutMs: Long): Boolean =
+        sessionOwner?.let { terminatePtySession(it, timeoutMs) } ?: false
+
     // 为本地终端提供的便利构造函数
     constructor(process: Process, masterFd: FileDescriptor, ptyMaster: Int) : this(
         process = process,
@@ -80,26 +86,49 @@ open class Pty(
             }
 
             val fileDescriptor = Reflect.getFileDescriptor(masterFdInt)
+            val ownerIdentity = readSessionProcess(pid)?.copy(sessionId = pid)
             
             // We need a Process object to manage the subprocess lifetime
             val dummyProcess = object : Process() {
+                @Volatile private var reapedExitCode: Int? = null
+
                 override fun destroy() {
-                    // Send SIGHUP to the process group to ensure all child processes are terminated
+                    // Teardown may already have reaped the leader. Never signal a reused PID.
+                    if (ownerIdentity == null) return
+                    fun signalIfOwned(signal: Int) {
+                        val current = readSessionProcess(pid) ?: return
+                        if (current.startTime == ownerIdentity.startTime) {
+                            Os.kill(pid, signal)
+                        }
+                    }
+                    // Legacy close signals only the leader. Fault recovery uses terminateSession.
                     try {
-                        android.os.Process.sendSignal(pid, 1) // SIGHUP
+                        signalIfOwned(OsConstants.SIGHUP)
                     } catch (e: Exception) {
                         // Ignore
                     }
                     
                     // Send SIGKILL to ensure the process is dead immediately
                     try {
-                        android.os.Process.sendSignal(pid, 9) // SIGKILL
+                        signalIfOwned(OsConstants.SIGKILL)
                     } catch (e: Exception) {
                         // Ignore
                     }
                 }
 
                 override fun exitValue(): Int {
+                    reapedExitCode?.let { return it }
+                    val current = readSessionProcess(pid)
+                    if (ownerIdentity != null && current != null) {
+                        if (current.startTime != ownerIdentity.startTime) {
+                            reapedExitCode = 0
+                            return 0
+                        }
+                        if (current.state == "Z" || current.state == "X") {
+                            // kill(pid, 0) also succeeds for zombies. Reap our exited child.
+                            return waitFor()
+                        }
+                    }
                     val probeResult =
                         try {
                             Os.kill(pid, 0)
@@ -122,11 +151,19 @@ open class Pty(
                 override fun getOutputStream(): OutputStream? = null
 
                 override fun waitFor(): Int {
-                    return Companion.waitFor(pid)
+                    // exitValue may reap a zombie first. Keep the status for subsequent callers,
+                    // and never issue a second waitpid for a PID that may already be reused.
+                    return synchronized(this) {
+                        reapedExitCode ?: Companion.waitFor(pid).also { reapedExitCode = it }
+                    }
                 }
             }
             
-            return Pty(dummyProcess, fileDescriptor, masterFdInt)
+            return Pty(dummyProcess, fileDescriptor, masterFdInt).also {
+                // forkpty's parent may run before the child finishes setsid. The start time
+                // identifies our child; the expected SID is its PID and is checked at teardown.
+                it.sessionOwner = ownerIdentity
+            }
         }
 
         private external fun createSubprocess(cmdArray: Array<String>, envArray: Array<String>, workingDir: String): IntArray

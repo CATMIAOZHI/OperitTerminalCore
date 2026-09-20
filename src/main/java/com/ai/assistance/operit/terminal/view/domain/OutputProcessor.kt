@@ -576,7 +576,8 @@ class OutputProcessor(
                 commandId = lastExecutingItem.id,
                 sessionId = sessionId,
                 outputChunk = finalOutput,
-                isCompleted = true
+                isCompleted = true,
+                terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id) "cancelled" else null
             ))
 
             // Clear the reference since command is no longer executing
@@ -603,6 +604,14 @@ class OutputProcessor(
         }
 
         val session = sessionManager.getSession(sessionId) ?: return
+        finishClosedSession(session, message)
+    }
+
+    /** Caller owns the shared command monitor, including after removal from SessionManager. */
+    fun finishClosedSession(session: TerminalSessionData, message: String) {
+        if (session.commandLifecycle.closed) return
+        session.commandLifecycle.closed = true
+        val sessionId = session.id
         session.rawBuffer.clear()
         session.ansiParser.parse("\r\n$message\r\n")
 
@@ -633,7 +642,8 @@ class OutputProcessor(
                     commandId = lastExecutingItem.id,
                     sessionId = sessionId,
                     outputChunk = finalOutput,
-                    isCompleted = true
+                    isCompleted = true,
+                    terminationReason = "session_closed"
                 )
             )
 
@@ -642,6 +652,15 @@ class OutputProcessor(
 
         session.currentCommandOutput.clear()
         session.currentOutputLineCount = 0
+        session.commandQueue.forEach {
+            onCommandExecutionEvent(CommandExecutionEvent(
+                commandId = it.id,
+                sessionId = sessionId,
+                outputChunk = "",
+                isCompleted = true,
+                terminationReason = "session_closed"
+            ))
+        }
         session.commandQueue.clear()
     }
 

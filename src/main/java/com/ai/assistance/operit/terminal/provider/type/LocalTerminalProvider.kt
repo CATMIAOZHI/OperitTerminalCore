@@ -83,10 +83,19 @@ class LocalTerminalProvider(
     }
 
     override suspend fun startSession(sessionId: String): Result<Pair<TerminalSession, Pty>> {
+        return startSession(sessionId, automation = false)
+    }
+
+    suspend fun startAutomationSession(sessionId: String): Result<Pair<TerminalSession, Pty>> =
+        startSession(sessionId, automation = true)
+
+    private suspend fun startSession(sessionId: String, automation: Boolean): Result<Pair<TerminalSession, Pty>> {
         return withContext(Dispatchers.IO) {
             try {
                 val command = buildVisibleSessionCommand()
-                val env = buildEnvironment()
+                val env = buildEnvironment().toMutableMap().apply {
+                    if (automation) put("OPERIT_AUTOMATION", "1")
+                }
 
                 Log.d(TAG, "Starting local terminal session with command: ${command.joinToString(" ")}")
                 Log.d(TAG, "Environment: $env")

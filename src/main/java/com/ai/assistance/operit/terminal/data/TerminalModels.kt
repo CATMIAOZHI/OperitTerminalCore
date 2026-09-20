@@ -7,7 +7,6 @@ import androidx.compose.runtime.setValue
 import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiTerminalEmulator
 import com.ai.assistance.operit.terminal.provider.type.TerminalType
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.serialization.Serializable
 import java.io.OutputStreamWriter
 import java.util.UUID
@@ -19,6 +18,13 @@ data class QueuedCommand(
     val id: String,
     val command: String
 )
+
+/** Shared by session copies; all command transitions use this monitor. */
+class CommandLifecycle {
+    @Volatile var closed = false
+    var cancellingCommandId: String? = null
+    val cancellationMutex = kotlinx.coroutines.sync.Mutex()
+}
 
 /**
  * 命令历史项数据类
@@ -82,6 +88,7 @@ data class TerminalSessionData(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val terminalType: TerminalType = TerminalType.LOCAL,
+    val automation: Boolean = false,
     val terminalSession: com.ai.assistance.operit.terminal.TerminalSession? = null,
     val pty: com.ai.assistance.operit.terminal.Pty? = null, // PTY 对象，用于获取终端模式
     val sessionWriter: OutputStreamWriter? = null,
@@ -99,7 +106,7 @@ data class TerminalSessionData(
     @Transient var currentExecutingCommand: CommandHistoryItem? = null,
     @Transient var currentOutputLineCount: Int = 0,
     @Transient val commandQueue: MutableList<QueuedCommand> = mutableListOf(),
-    @Transient val commandMutex: Mutex = Mutex(),
+    @Transient val commandLifecycle: CommandLifecycle = CommandLifecycle(),
     // 保存每个会话的滚动位置
     var scrollOffsetY: Float = 0f
 ) {
@@ -150,4 +157,4 @@ data class SourceConfig(
     val packageManager: PackageManagerType,
     val selectedSourceId: String,
     val sources: List<MirrorSource>
-) 
+)
