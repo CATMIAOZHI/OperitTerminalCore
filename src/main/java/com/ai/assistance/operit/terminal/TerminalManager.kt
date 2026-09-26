@@ -139,6 +139,12 @@ class TerminalManager private constructor(
     val terminalEmulator = terminalState.map { it.currentSession?.ansiParser ?: AnsiTerminalEmulator() }
 
     companion object {
+        @Volatile private var ubuntuArchivePreparer: (suspend (Context, File) -> Unit)? = null
+
+        /** Host may supply a verified archive; standalone consumers retain bundled assets. */
+        fun setUbuntuArchivePreparer(preparer: suspend (Context, File) -> Unit) {
+            ubuntuArchivePreparer = preparer
+        }
         @Volatile
         private var INSTANCE: TerminalManager? = null
 
@@ -198,6 +204,8 @@ class TerminalManager private constructor(
             TerminalType.LOCAL
         }
         
+        // Downloads may take minutes. The READY timeout measures shell startup only.
+        check(initializeEnvironment()) { "Terminal environment initialization failed" }
         val newSession = sessionManager.createNewSession(title, terminalType, makeCurrent, automation)
         val startup = CompletableDeferred<Process?>()
         sessionStartups[newSession.id] = startup
@@ -765,6 +773,7 @@ class TerminalManager private constructor(
                     Log.d(TAG, "Environment initialization completed successfully.")
                     true
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     Log.e(TAG, "Environment initialization failed", e)
                     false
                 }
@@ -910,7 +919,7 @@ class TerminalManager private constructor(
         Files.createSymbolicLink(linkFile.toPath(), targetPath)
     }
 
-    private fun extractAssets() {
+    private suspend fun extractAssets() {
         try {
             val assets = listOf(
                 UBUNTU_FILENAME,
@@ -918,6 +927,19 @@ class TerminalManager private constructor(
             )
             assets.forEach { assetName ->
                 val assetFile = File(filesDir, assetName)
+                if (assetName == UBUNTU_FILENAME) {
+                    val rootfs = File(usrDir, "var/lib/proot-distro/installed-rootfs/ubuntu")
+                    // Match the install script, including installations predating the marker.
+                    val installed = File(rootfs, ".operit_installed_ok").isFile ||
+                        File(rootfs, "etc/issue.net").isFile
+                    if (installed) return@forEach
+                    val preparer = ubuntuArchivePreparer
+                    if (preparer != null) {
+                        preparer(context, assetFile)
+                        check(assetFile.isFile && assetFile.length() > 0L) { "Ubuntu archive was not prepared" }
+                        return@forEach
+                    }
+                }
                 // 强制更新脚本文件，大文件只在不存在时提取
                 val shouldExtract = !assetFile.exists() || assetName == "setup_fake_sysdata.sh"
 
@@ -1569,6 +1591,7 @@ $prootBindSetup
     }
 
     fun prepareForMaintenance() {
+        isEnvInitialized = false
         // 释放 provider 连接
         kotlinx.coroutines.runBlocking {
             terminalProvider?.disconnect()
@@ -1590,6 +1613,18 @@ $prootBindSetup
         }
         sessionManager.cleanup()
         Log.d(TAG, "Prepared terminal manager for maintenance.")
+    }
+
+    /** Prevent resource preparation and destructive reset from interleaving. */
+    suspend fun <T> withEnvironmentMaintenance(block: suspend () -> T): T {
+        envInitMutex.lock()
+        try {
+            prepareForMaintenance()
+            return block()
+        } finally {
+            isEnvInitialized = false
+            envInitMutex.unlock()
+        }
     }
 
     fun cleanup() {

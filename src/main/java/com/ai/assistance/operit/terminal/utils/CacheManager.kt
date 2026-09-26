@@ -418,7 +418,11 @@ class CacheManager(private val context: Context) {
         totalSize
     }
 
-    suspend fun clearCache(terminalManager: com.ai.assistance.operit.terminal.TerminalManager? = null) = withContext(Dispatchers.IO) {
+    suspend fun clearCache(terminalManager: com.ai.assistance.operit.terminal.TerminalManager? = null): Unit = withContext(Dispatchers.IO) {
+        if (terminalManager != null) {
+            terminalManager.withEnvironmentMaintenance { clearCache(null) }
+            return@withContext
+        }
         Log.w(TAG, "Reset: start. filesDir=${filesDir.absolutePath}")
         // 首先停止所有终端会话
         Log.d(TAG, "Reset: stopping terminal sessions...")
