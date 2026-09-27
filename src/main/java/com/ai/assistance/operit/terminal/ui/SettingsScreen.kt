@@ -32,6 +32,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ai.assistance.operit.terminal.data.PackageManagerType
 import com.ai.assistance.operit.terminal.data.SourceConfig
 import com.ai.assistance.operit.terminal.utils.TerminalFontConfigManager
+import com.ai.assistance.operit.terminal.utils.TerminalProjectInfo
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 
@@ -312,7 +313,7 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = context.getString(com.ai.assistance.operit.terminal.R.string.project_name),
+                        text = TerminalProjectInfo.displayName,
                         color = SettingsTheme.onSurfaceVariant,
                         fontSize = 14.sp
                     )

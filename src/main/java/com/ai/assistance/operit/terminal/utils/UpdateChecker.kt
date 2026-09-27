@@ -16,9 +16,15 @@ import java.util.regex.Pattern
 class UpdateChecker(private val context: Context) {
 
     companion object {
-        private const val GITHUB_API_URL = "https://api.github.com/repos/AAswordman/OperitTerminal/tags"
-        const val GITHUB_REPO_URL = "https://github.com/AAswordman/OperitTerminal"
-        const val GITHUB_RELEASES_URL = "https://github.com/AAswordman/OperitTerminal/releases"
+        /**
+         * Both links follow [TerminalProjectInfo], which the host application configures, and are
+         * kept here for callers that only want to show them.
+         */
+        val GITHUB_REPO_URL: String
+            get() = TerminalProjectInfo.repositoryUrl
+
+        val GITHUB_RELEASES_URL: String
+            get() = TerminalProjectInfo.releasesUrl
     }
 
     sealed class UpdateResult {
@@ -31,7 +37,7 @@ class UpdateChecker(private val context: Context) {
         try {
             val currentVersion = getCurrentAppVersion()
             
-            val url = URL(GITHUB_API_URL)
+            val url = URL(TerminalProjectInfo.tagsApiUrl)
             val connection = url.openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             
