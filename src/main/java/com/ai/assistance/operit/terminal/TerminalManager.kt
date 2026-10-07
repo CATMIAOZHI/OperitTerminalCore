@@ -86,6 +86,13 @@ class TerminalManager private constructor(
     private val sessionProcesses = ConcurrentHashMap<String, Process>()
     private val sessionStartups = ConcurrentHashMap<String, CompletableDeferred<Process?>>()
     private val processReapJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+    /** Optional host logger. Lifecycle diagnostics contain IDs, never commands or output. */
+    @Volatile var lifecycleLogger: ((String, Throwable?) -> Unit)? = null
+
+    private fun logLifecycle(message: String, error: Throwable? = null) {
+        Log.i(TAG, message, error)
+        runCatching { lifecycleLogger?.invoke(message, error) }
+    }
     
     // SharedPreferences for reading settings
     private val prefs = context.getSharedPreferences("terminal_settings", Context.MODE_PRIVATE)
@@ -522,6 +529,7 @@ class TerminalManager private constructor(
      */
     private fun executeCommandInternal(command: String, session: TerminalSessionData, commandId: String) {
             handleRegularCommand(command, session, commandId)
+            logLifecycle("session=${session.id} command=$commandId submitted")
             try {
                 val fullInput = "$command$TERMINAL_ENTER"
                 writeInputToKernel(session, fullInput, "command")
@@ -620,8 +628,9 @@ class TerminalManager private constructor(
                 val sessionWriter = terminalSession.stdin.writer()
 
                 // 启动读取协程
-                val readJob = launch {
+                val readJob = launch(start = CoroutineStart.LAZY) {
                     var reachedEof = false
+                    var readFailure: Exception? = null
                     try {
                         terminalSession.stdout.use { inputStream ->
                             val buffer = ByteArray(4096)
@@ -637,19 +646,35 @@ class TerminalManager private constructor(
                             }
                             reachedEof = true
                         }
-                    } catch (e: java.io.InterruptedIOException) {
-                        Log.i(TAG, "Read job interrupted for session $sessionId.")
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error in read job for session $sessionId", e)
+                        readFailure = e
                     } finally {
-                        if (closingSessions.remove(sessionId)) {
+                        if (closingSessions.contains(sessionId) || session.commandLifecycle.closed) {
                             return@launch
                         }
-                        if (reachedEof || !terminalSession.process.isAlive) {
+                        if (reachedEof || readFailure != null || !terminalSession.process.isAlive) {
+                            logLifecycle(
+                                "session=$sessionId readerStopped eof=$reachedEof processAlive=${terminalSession.process.isAlive}",
+                                readFailure
+                            )
                             handleTerminalSessionExit(sessionId, terminalSession)
+                            // A dead reader cannot safely service any subsequent command.
+                            retireTerminalOutput(sessionId, pty)
                         }
                     }
                 }
+                val exitJob = launch(start = CoroutineStart.LAZY) {
+                    val drained = awaitTerminalExit({ terminalSession.process.isAlive }, readJob)
+                    logLifecycle("session=$sessionId processExited outputDrained=$drained")
+                    handleTerminalSessionExit(sessionId, terminalSession)
+                    withContext(NonCancellable) {
+                        readJob.cancel()
+                        retireTerminalOutput(sessionId, pty)
+                    }
+                }
+                readJob.invokeOnCompletion { closingSessions.remove(sessionId) }
 
                 // 更新会话信息
                 sessionManager.updateSession(sessionId) { session ->
@@ -657,8 +682,18 @@ class TerminalManager private constructor(
                         terminalSession = terminalSession,
                         pty = pty,
                         sessionWriter = sessionWriter,
-                        readJob = readJob
+                        readJob = readJob,
+                        exitJob = exitJob
                     )
+                }
+                if (sessionManager.getSession(sessionId) == null) {
+                    readJob.cancel()
+                    exitJob.cancel()
+                    closeTerminalSession(sessionId)
+                } else {
+                    logLifecycle("session=$sessionId started automation=${session.automation}")
+                    readJob.start()
+                    exitJob.start()
                 }
             } catch (e: Exception) {
                 startup.complete(sessionProcesses[sessionId])
@@ -691,9 +726,13 @@ class TerminalManager private constructor(
                     }
             }
 
-        Log.i(TAG, "Terminal session $sessionId exited with code $exitCode")
+        logLifecycle("session=$sessionId completed exitCode=$exitCode")
         val session = sessionManager.getSession(sessionId) ?: return
         synchronized(session.commandLifecycle) {
+          logLifecycle(
+              "session=$sessionId command=${session.currentExecutingCommand?.id} " +
+                  "pending=${session.commandQueue.size} alreadyClosed=${session.commandLifecycle.closed}"
+          )
           outputProcessor.handleSessionExit(
             sessionId = sessionId,
             message = context.getString(R.string.terminal_exited_with_code, exitCode),
@@ -701,6 +740,22 @@ class TerminalManager private constructor(
           )
         }
     }
+
+    private suspend fun retireTerminalOutput(sessionId: String, pty: Pty) =
+        withContext(NonCancellable) {
+            try {
+                val cleaned = pty.terminateSession(2_000L)
+                logLifecycle("session=$sessionId processCleanup=$cleaned")
+            } catch (error: Exception) {
+                logLifecycle("session=$sessionId processCleanupFailed", error)
+            } finally {
+                // Closing only the leader does not release a reader held by descendants.
+                runCatching { pty.destroy() }
+                    .onFailure { logLifecycle("session=$sessionId outputCloseFailed", it) }
+                closeTerminalSession(sessionId)
+                closingSessions.remove(sessionId)
+            }
+        }
     
     /**
      * 获取或创建单例的终端提供者
@@ -1512,6 +1567,8 @@ $prootBindSetup
     }
 
     fun closeTerminalSession(sessionId: String) {
+        sessionManager.getSession(sessionId)?.exitJob?.cancel()
+        logLifecycle("session=$sessionId closing")
         closingSessions.add(sessionId)
         sessionProcesses[sessionId]?.let { process ->
             destroyAndReapSessionProcess(sessionId, process)

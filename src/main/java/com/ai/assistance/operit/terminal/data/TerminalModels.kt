@@ -101,6 +101,7 @@ data class TerminalSessionData(
     val interactivePrompt: String = "",
     val initState: SessionInitState = SessionInitState.INITIALIZING,
     val readJob: Job? = null,
+    val exitJob: Job? = null,
     val isFullscreen: Boolean = false,
     @Transient val ansiParser: AnsiTerminalEmulator = AnsiTerminalEmulator(),
     @Transient var currentExecutingCommand: CommandHistoryItem? = null,

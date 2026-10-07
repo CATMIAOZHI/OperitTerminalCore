@@ -85,6 +85,7 @@ class SessionManager(private val terminalManager: TerminalManager) {
             session
         }
         try {
+            sessionToClose.exitJob?.cancel()
             sessionToClose.readJob?.cancel()
             sessionToClose.sessionWriter?.close()
         } catch (e: Exception) {

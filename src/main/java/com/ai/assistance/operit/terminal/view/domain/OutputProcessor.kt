@@ -612,12 +612,14 @@ class OutputProcessor(
         if (session.commandLifecycle.closed) return
         session.commandLifecycle.closed = true
         val sessionId = session.id
+        val remainingOutput = AnsiUtils.stripAnsi(session.rawBuffer.toString())
         session.rawBuffer.clear()
         session.ansiParser.parse("\r\n$message\r\n")
 
         val lastExecutingItem = session.currentExecutingCommand
         if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
             val builder = session.currentCommandOutput
+            builder.append(remainingOutput)
             if (builder.isNotEmpty() && builder.last() != '\n') {
                 builder.append('\n')
             }
