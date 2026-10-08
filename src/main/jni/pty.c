@@ -128,8 +128,12 @@ Java_com_ai_assistance_operit_terminal_Pty_00024Companion_createSubprocess(JNIEn
 
 JNIEXPORT jint JNICALL
 Java_com_ai_assistance_operit_terminal_Pty_00024Companion_waitFor(JNIEnv *env, jobject thiz, jint pid) {
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    pid_t result;
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result == -1 && errno == EINTR);
+    if (result != pid) return -1;
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
     }
@@ -205,4 +209,4 @@ Java_com_ai_assistance_operit_terminal_Pty_setPtyWindowSize(JNIEnv *env, jobject
     
     LOGD("PTY window size set to %dx%d for fd %d", rows, cols, fd);
     return 0;
-} 
+}

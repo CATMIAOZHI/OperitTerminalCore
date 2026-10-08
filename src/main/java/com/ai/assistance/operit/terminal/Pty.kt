@@ -19,7 +19,7 @@ internal enum class PtyProcessProbeResult {
 
 internal fun ptyProcessExitValue(probeResult: PtyProcessProbeResult): Int =
     when (probeResult) {
-        PtyProcessProbeResult.DEAD -> 0
+        PtyProcessProbeResult.DEAD -> -1 // Process disappearance does not establish a successful exit.
         PtyProcessProbeResult.ALIVE -> throw IllegalThreadStateException("Process hasn't exited")
     }
 
@@ -121,8 +121,8 @@ open class Pty(
                     val current = readSessionProcess(pid)
                     if (ownerIdentity != null && current != null) {
                         if (current.startTime != ownerIdentity.startTime) {
-                            reapedExitCode = 0
-                            return 0
+                            reapedExitCode = -1
+                            return -1
                         }
                         if (current.state == "Z" || current.state == "X") {
                             // kill(pid, 0) also succeeds for zombies. Reap our exited child.

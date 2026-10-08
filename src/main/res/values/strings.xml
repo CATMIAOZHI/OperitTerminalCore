@@ -126,6 +126,7 @@
     <string name="interrupt">中断</string>
     <string name="environment_setup">环境配置</string>
     <string name="terminal_exited_with_code">终端已退出，退出码：%1$d</string>
+    <string name="terminal_exited_code_unknown">终端会话已关闭，退出码未知</string>
     <string name="settings">设置</string>
     
     <!-- Additional new strings -->

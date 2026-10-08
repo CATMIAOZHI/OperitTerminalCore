@@ -45,6 +45,67 @@ class OutputProcessor(
         sessionManager: SessionManager
     ) {
         val session = sessionManager.getSession(sessionId) ?: return
+        var dynamic = session.isFullscreen
+        session.commandLifecycle.outputFramer.feed(chunk) { frame ->
+            val current = sessionManager.getSession(sessionId) ?: return@feed
+            val protocol = current.commandLifecycle.protocol
+            val result = Regex("\u001b]633;Operit;([a-f0-9]+);([0-9]{1,3})(?:\u0007|\u001b\\\\)")
+                .matchEntire(frame)
+            if (result != null && current.automation) {
+                val token = result.groupValues[1]
+                val code = result.groupValues[2].toInt().takeIf { it in 0..255 }
+                if (token == protocol.token && protocol.installing) {
+                    protocol.ready = true
+                } else if (token == protocol.activeToken && code != null) {
+                    publishScreen(sessionId, sessionManager)
+                    val tail = AnsiUtils.stripAnsi(current.rawBuffer.toString())
+                    current.rawBuffer.clear()
+                    if (tail.isNotEmpty()) updateCommandOutput(sessionId, tail, sessionManager)
+                    finishCurrentCommand(sessionId, sessionManager, code)
+                }
+                return@feed
+            }
+            if (frame == "\u001b[?1049h" || frame == "\u001b[?1049l") {
+                if (current.isFullscreen) publishScreen(sessionId, sessionManager)
+                else {
+                    val tail = AnsiUtils.stripAnsi(current.rawBuffer.toString())
+                    if (tail.isNotEmpty()) updateCommandOutput(sessionId, tail, sessionManager)
+                }
+                current.rawBuffer.clear()
+                current.ansiParser.parse(frame)
+                sessionManager.updateSession(sessionId) { it.copy(isFullscreen = frame.endsWith("h")) }
+                dynamic = true
+                // Leaving the alternate screen says nothing about command completion.
+            } else if (current.isFullscreen) {
+                current.ansiParser.parse(frame)
+                dynamic = true
+            } else {
+                processText(sessionId, frame, sessionManager)
+            }
+        }
+        val current = sessionManager.getSession(sessionId) ?: return
+        if (dynamic || current.rawBuffer.isNotEmpty() || chunk.contains('\r')) {
+            publishScreen(sessionId, sessionManager)
+        }
+    }
+
+    private fun publishScreen(sessionId: String, sessionManager: SessionManager) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        val item = session.currentExecutingCommand ?: return
+        val screen = session.ansiParser.getScreenContent().joinToString("\n") { row ->
+            row.joinToString("") { it.char.toString() }.trimEnd()
+        }.trimEnd().takeLast(12_000)
+        if (screen == session.commandLifecycle.latestScreen) return
+        session.commandLifecycle.latestScreen = screen
+        onCommandExecutionEvent(CommandExecutionEvent(item.id, sessionId, "", false, screen = screen))
+    }
+
+    private fun processText(
+        sessionId: String,
+        chunk: String,
+        sessionManager: SessionManager
+    ) {
+        val session = sessionManager.getSession(sessionId) ?: return
         session.rawBuffer.append(chunk)
 
         if (session.rawBuffer.length > MAX_RAW_BUFFER_CHARS) {
@@ -53,12 +114,6 @@ class OutputProcessor(
         }
 
         Log.d(TAG, "Processing chunk for session $sessionId. New buffer size: ${session.rawBuffer.length}")
-
-        // 始终检查全屏模式切换
-        if (detectFullscreenMode(sessionId, session.rawBuffer, sessionManager)) {
-            // 如果检测到模式切换，缓冲区可能已被修改，及早返回以处理下一个块
-            return
-        }
 
         // 始终更新 ANSI 解析器（用于 Canvas 渲染），包括初始化阶段
         // 这样用户可以看到初始化过程中的所有输出，包括错误信息
@@ -162,9 +217,8 @@ class OutputProcessor(
         
         // 检查是否是命令提示符（优先级最高）
         // 即使是 CR line，如果是提示符也应该作为命令完成处理
-        if (isPrompt(cleanLine.trim())) {
+        if (isPrompt(cleanLine.trim()) && handlePrompt(sessionId, cleanLine, sessionManager)) {
             Log.d(TAG, "Detected prompt in CR line: '$cleanLine'")
-            handlePrompt(sessionId, cleanLine, sessionManager)
             sessionStates[sessionId]?.justHandledCarriageReturn = false
             return
         }
@@ -258,6 +312,16 @@ class OutputProcessor(
         val cleanLine = AnsiUtils.stripAnsi(line)
         Log.d(TAG, "handleAwaitingFirstPromptState: checking line: '$cleanLine'")
         if (handlePrompt(sessionId, cleanLine, sessionManager)) {
+            val session = sessionManager.getSession(sessionId) ?: return
+            val protocol = session.commandLifecycle.protocol
+            if (session.automation && session.terminalType == com.ai.assistance.operit.terminal.provider.type.TerminalType.LOCAL &&
+                !protocol.ready) {
+                if (!protocol.installing) {
+                    protocol.installing = true
+                    session.sessionWriter?.apply { write(protocol.bootstrap() + "\n"); flush() }
+                }
+                return
+            }
             Log.d(TAG, "First prompt detected. Session is now ready.")
             sessionManager.updateSession(sessionId) { session ->
                 session.copy(initState = SessionInitState.READY)
@@ -330,6 +394,9 @@ class OutputProcessor(
         sessionManager: SessionManager
     ): Boolean {
         val session = sessionManager.getSession(sessionId) ?: return false
+        // Automation completion comes from the command token, not arbitrary output ending in #/$.
+        if (session.commandLifecycle.protocol.activeToken != null &&
+            session.commandLifecycle.cancellingCommandId == null) return false
 
         val cwdPromptRegex = Regex("<cwd>(.*)</cwd>.*[#$]")
         val match = cwdPromptRegex.find(line)
@@ -465,7 +532,8 @@ class OutputProcessor(
         if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
             val commandToCheck = lastExecutingItem.command.trim()
             val lineToCheck = cleanLine.trim()
-            val isMatch = lineToCheck == commandToCheck
+            val isMatch = lineToCheck == commandToCheck ||
+                lineToCheck == session.commandLifecycle.protocol.envelope
 
             if (session.currentCommandOutput.isEmpty() && isMatch) {
                 return true
@@ -541,7 +609,7 @@ class OutputProcessor(
         }
     }
 
-    private fun finishCurrentCommand(sessionId: String, sessionManager: SessionManager) {
+    private fun finishCurrentCommand(sessionId: String, sessionManager: SessionManager, exitCode: Int? = null) {
         sessionManager.updateSession(sessionId) { session ->
             session.copy(
                 isWaitingForInteractiveInput = false,
@@ -577,12 +645,16 @@ class OutputProcessor(
                 sessionId = sessionId,
                 outputChunk = finalOutput,
                 isCompleted = true,
-                terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id) "cancelled" else null
+                terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id) "cancelled" else null,
+                exitCode = exitCode,
+                screen = session.commandLifecycle.latestScreen
             ))
 
             // Clear the reference since command is no longer executing
             session.currentExecutingCommand = null
             session.currentCommandOutput.clear()
+            session.commandLifecycle.protocol.activeToken = null
+            session.commandLifecycle.protocol.envelope = null
             
             // 通知命令已完成，可以处理下一个队列命令
             onCommandCompleted(sessionId)
@@ -592,7 +664,8 @@ class OutputProcessor(
     fun handleSessionExit(
         sessionId: String,
         message: String,
-        sessionManager: SessionManager
+        sessionManager: SessionManager,
+        sessionExitCode: Int? = null
     ) {
         sessionManager.updateSession(sessionId) {
             it.copy(
@@ -604,11 +677,11 @@ class OutputProcessor(
         }
 
         val session = sessionManager.getSession(sessionId) ?: return
-        finishClosedSession(session, message)
+        finishClosedSession(session, message, sessionExitCode)
     }
 
     /** Caller owns the shared command monitor, including after removal from SessionManager. */
-    fun finishClosedSession(session: TerminalSessionData, message: String) {
+    fun finishClosedSession(session: TerminalSessionData, message: String, sessionExitCode: Int? = null) {
         if (session.commandLifecycle.closed) return
         session.commandLifecycle.closed = true
         val sessionId = session.id
@@ -645,7 +718,9 @@ class OutputProcessor(
                     sessionId = sessionId,
                     outputChunk = finalOutput,
                     isCompleted = true,
-                    terminationReason = "session_closed"
+                    terminationReason = "session_closed",
+                    sessionExitCode = sessionExitCode,
+                    screen = session.commandLifecycle.latestScreen
                 )
             )
 
@@ -664,56 +739,6 @@ class OutputProcessor(
             ))
         }
         session.commandQueue.clear()
-    }
-
-    /**
-     * 检测并处理全屏模式切换
-     * @return 如果处理了全屏模式切换，则返回 true
-     */
-    private fun detectFullscreenMode(sessionId: String, buffer: StringBuilder, sessionManager: SessionManager): Boolean {
-        // CSI ? 1049 h: 启用备用屏幕缓冲区（进入全屏模式）
-        // CSI ? 1049 l: 禁用备用屏幕缓冲区（退出全屏模式）
-        val enterFullscreen = "\u001B[?1049h"
-        val exitFullscreen = "\u001B[?1049l"
-
-        val bufferContent = buffer.toString()
-
-        val enterIndex = bufferContent.indexOf(enterFullscreen)
-        val exitIndex = bufferContent.indexOf(exitFullscreen)
-
-        if (enterIndex != -1) {
-            Log.d(TAG, "Entering fullscreen mode for session $sessionId")
-            
-            sessionManager.updateSession(sessionId) { session ->
-                session.copy(isFullscreen = true)
-            }
-            
-            // 清空缓冲区，ansiParser 已经包含所有内容
-            buffer.clear()
-            return true
-        }
-
-        if (exitIndex != -1) {
-            Log.d(TAG, "Exiting fullscreen mode for session $sessionId")
-            val outputBeforeExit = bufferContent.substring(0, exitIndex)
-
-            // 更新最后一个命令的输出
-            if (outputBeforeExit.isNotEmpty()) {
-                updateCommandOutput(sessionId, outputBeforeExit, sessionManager)
-            }
-
-            sessionManager.updateSession(sessionId) { session ->
-                session.copy(isFullscreen = false)
-            }
-
-            // 消耗包括退出代码在内的所有内容
-            buffer.delete(0, exitIndex + exitFullscreen.length)
-
-            // 退出全屏后，我们可能需要重新绘制提示符
-            finishCurrentCommand(sessionId, sessionManager)
-            return true
-        }
-        return false
     }
 
     /**

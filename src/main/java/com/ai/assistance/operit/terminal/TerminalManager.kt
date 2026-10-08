@@ -531,7 +531,10 @@ class TerminalManager private constructor(
             handleRegularCommand(command, session, commandId)
             logLifecycle("session=${session.id} command=$commandId submitted")
             try {
-                val fullInput = "$command$TERMINAL_ENTER"
+                session.commandLifecycle.latestScreen = null
+                val protocol = session.commandLifecycle.protocol
+                val submitted = if (session.automation && protocol.ready) protocol.command(command) else command
+                val fullInput = "$submitted$TERMINAL_ENTER"
                 writeInputToKernel(session, fullInput, "command")
                 Log.d(TAG, "Sent command to PTY: $command")
             } catch (e: Exception) {
@@ -632,8 +635,8 @@ class TerminalManager private constructor(
                     var reachedEof = false
                     var readFailure: Exception? = null
                     try {
-                        terminalSession.stdout.use { inputStream ->
-                            val buffer = ByteArray(4096)
+                        terminalSession.stdout.reader(Charsets.UTF_8).use { inputStream ->
+                            val buffer = CharArray(4096)
                             var bytesRead: Int
                             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                                 val chunk = String(buffer, 0, bytesRead)
@@ -659,6 +662,13 @@ class TerminalManager private constructor(
                                 "session=$sessionId readerStopped eof=$reachedEof processAlive=${terminalSession.process.isAlive}",
                                 readFailure
                             )
+                            // PTY EOF/EIO may arrive just before waitpid can observe the exit.
+                            // Bound the grace period; a broken output pipe must still retire.
+                            withContext(NonCancellable) {
+                                withTimeoutOrNull(500L) {
+                                    while (terminalSession.process.isAlive) delay(25)
+                                }
+                            }
                             handleTerminalSessionExit(sessionId, terminalSession)
                             // A dead reader cannot safely service any subsequent command.
                             retireTerminalOutput(sessionId, pty)
@@ -717,13 +727,13 @@ class TerminalManager private constructor(
 
         val exitCode =
             if (terminalSession.process.isAlive) {
-                -1
+                null
             } else {
                 runCatching { terminalSession.process.waitFor() }
                     .getOrElse {
                         Log.w(TAG, "Failed to read exit code for session $sessionId", it)
                         -1
-                    }
+                    }.takeIf { it >= 0 }
             }
 
         logLifecycle("session=$sessionId completed exitCode=$exitCode")
@@ -735,8 +745,10 @@ class TerminalManager private constructor(
           )
           outputProcessor.handleSessionExit(
             sessionId = sessionId,
-            message = context.getString(R.string.terminal_exited_with_code, exitCode),
-            sessionManager = sessionManager
+            message = if (exitCode == null) context.getString(R.string.terminal_exited_code_unknown)
+                else context.getString(R.string.terminal_exited_with_code, exitCode),
+            sessionManager = sessionManager,
+            sessionExitCode = exitCode
           )
         }
     }

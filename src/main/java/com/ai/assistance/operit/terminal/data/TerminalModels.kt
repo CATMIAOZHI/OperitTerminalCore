@@ -24,6 +24,9 @@ class CommandLifecycle {
     @Volatile var closed = false
     var cancellingCommandId: String? = null
     val cancellationMutex = kotlinx.coroutines.sync.Mutex()
+    val protocol = com.ai.assistance.operit.terminal.CommandProtocol()
+    val outputFramer = com.ai.assistance.operit.terminal.TerminalOutputFramer()
+    var latestScreen: String? = null
 }
 
 /**

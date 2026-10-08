@@ -17,6 +17,6 @@ class PtyProcessPolicyTest {
 
     @Test
     fun `dead PTY process exposes a completed exit value`() {
-        assertEquals(0, ptyProcessExitValue(PtyProcessProbeResult.DEAD))
+        assertEquals(-1, ptyProcessExitValue(PtyProcessProbeResult.DEAD))
     }
 }
