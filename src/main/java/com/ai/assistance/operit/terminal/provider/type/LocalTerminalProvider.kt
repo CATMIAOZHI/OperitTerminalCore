@@ -8,6 +8,7 @@ import com.ai.assistance.operit.terminal.Pty
 import com.ai.assistance.operit.terminal.TerminalSession
 import com.ai.assistance.operit.terminal.provider.filesystem.FileSystemProvider
 import com.ai.assistance.operit.terminal.provider.filesystem.LocalFileSystemProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -16,6 +17,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -128,7 +130,8 @@ class LocalTerminalProvider(
     override suspend fun executeHiddenCommand(
         command: String,
         executorKey: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        quiet: Boolean
     ): HiddenExecResult {
         val shell =
             try {
@@ -147,18 +150,33 @@ class LocalTerminalProvider(
             withTimeout(timeoutMs) {
                 shell.mutex.withLock {
                     val token = UUID.randomUUID().toString()
-                    Log.d(TAG, "Hidden exec command started: key=$executorKey token=$token timeoutMs=$timeoutMs command=${command.lineSequence().firstOrNull().orEmpty().take(200)}")
+                    Log.d(TAG, "Hidden exec command started: key=$executorKey token=$token timeoutMs=$timeoutMs" +
+                        if (quiet) "" else " command=${command.lineSequence().firstOrNull().orEmpty().take(200)}")
                     val wrappedCommand = buildHiddenExecEnvelope(command, token)
-                    withContext(Dispatchers.IO) {
-                        shell.writer.write(wrappedCommand)
-                        shell.writer.flush()
+                    // What came back for this command so far, so a cancel can find its process group.
+                    val seen = StringBuilder()
+                    try {
+                        withContext(Dispatchers.IO) {
+                            shell.writer.write(wrappedCommand)
+                            shell.writer.flush()
+                        }
+                        collectHiddenExecResult(shell, token, timeoutMs, quiet, seen)
+                    } catch (e: CancellationException) {
+                        // Given up (the caller, or the time limit) once the command may have started: it runs
+                        // in its own process group, so stop that group too.
+                        // One non-cancellable block, so the close still runs after the stop returns here.
+                        withContext(NonCancellable) {
+                            stopCancelled(shell, token, seen)
+                            // Closed here, still holding its lock, so a later command never gets this shell.
+                            closeHiddenExecShell(executorKey, shell)
+                        }
+                        throw e
                     }
-                    collectHiddenExecResult(shell, token, timeoutMs)
                 }
             }
         } catch (e: TimeoutCancellationException) {
             hiddenExecScope.launch {
-                closeHiddenExecShell(executorKey)
+                closeHiddenExecShell(executorKey, shell)
             }
             HiddenExecResult(
                 output = "",
@@ -166,9 +184,12 @@ class LocalTerminalProvider(
                 state = HiddenExecResult.State.TIMEOUT,
                 error = "Hidden exec command timed out after ${timeoutMs}ms"
             )
+        } catch (e: CancellationException) {
+            // The caller was cancelled; a started command and its shell were stopped above.
+            throw e
         } catch (e: Exception) {
             hiddenExecScope.launch {
-                closeHiddenExecShell(executorKey)
+                closeHiddenExecShell(executorKey, shell)
             }
             Log.e(TAG, "Failed to execute hidden command in shell: $executorKey", e)
             HiddenExecResult(
@@ -317,18 +338,19 @@ class LocalTerminalProvider(
     private suspend fun collectHiddenExecResult(
         shell: HiddenExecShell,
         token: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        quiet: Boolean = false,
+        builder: StringBuilder = StringBuilder()
     ): HiddenExecResult {
         val endMarkerPrefix = "$END_MARKER_PREFIX$token:"
         val deadline = System.currentTimeMillis() + timeoutMs
-        val builder = StringBuilder()
 
         while (System.currentTimeMillis() < deadline) {
             val chunk =
                 withTimeoutOrNull((deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
                     shell.outputChannel.receiveCatching().getOrNull()
                 } ?: break
-            logHiddenExecChunk(shell.key, token, chunk)
+            if (!quiet) logHiddenExecChunk(shell.key, token, chunk)
             builder.append(chunk)
             if (builder.indexOf(endMarkerPrefix) >= 0) {
                 break
@@ -439,6 +461,27 @@ class LocalTerminalProvider(
         return builder.toString()
     }
 
+    /**
+     * After a cancel: waits a little for the command's process id (or its end) and stops its process
+     * group, which `setsid` keeps apart from the hidden shell. [seen] is what was read so far.
+     */
+    private suspend fun stopCancelled(shell: HiddenExecShell, token: String, seen: StringBuilder) =
+        withContext(NonCancellable + Dispatchers.IO) {
+            val endMarkerPrefix = "$END_MARKER_PREFIX$token:"
+            val pidMarker = "$PID_MARKER_PREFIX$token:"
+            // The whole line, so a number cut between two reads is not taken for another process.
+            fun pidReady(): Boolean {
+                val at = seen.indexOf(pidMarker)
+                return at >= 0 && seen.indexOf("\n", at + pidMarker.length) >= 0
+            }
+            withTimeoutOrNull(HIDDEN_EXEC_CANCEL_SETTLE_TIMEOUT_MS) {
+                while (!pidReady() && seen.indexOf(endMarkerPrefix) < 0) {
+                    seen.append(shell.outputChannel.receiveCatching().getOrNull() ?: break)
+                }
+            }
+            if (seen.indexOf(endMarkerPrefix) < 0 && pidReady()) cancelHiddenExecCommand(seen.toString(), token)
+        }
+
     private fun cancelHiddenExecCommand(rawOutput: String, token: String) {
         val pid = extractHiddenExecPid(rawOutput, token) ?: return
         runCatching {
@@ -489,8 +532,11 @@ class LocalTerminalProvider(
             .trimEnd('\n', '\r')
     }
 
-    private suspend fun closeHiddenExecShell(executorKey: String) {
-        hiddenExecShells.remove(executorKey)?.let { shell ->
+    /** With [only], closes that shell and only while it is still the one in use for [executorKey]. */
+    private suspend fun closeHiddenExecShell(executorKey: String, only: HiddenExecShell? = null) {
+        val removed = if (only == null) hiddenExecShells.remove(executorKey)
+            else only.takeIf { hiddenExecShells.remove(executorKey, it) }
+        removed?.let { shell ->
             withContext(Dispatchers.IO) {
                 runCatching { shell.writer.close() }
                 runCatching { shell.process.destroy() }

@@ -73,7 +73,9 @@ interface TerminalProvider {
     suspend fun executeHiddenCommand(
         command: String,
         executorKey: String = "default",
-        timeoutMs: Long = 120000L
+        timeoutMs: Long = 120000L,
+        /** Keep the command and its output out of the log: they may hold secrets. */
+        quiet: Boolean = false
     ): HiddenExecResult
     
     /**

@@ -160,7 +160,8 @@ class SSHTerminalProvider(
     override suspend fun executeHiddenCommand(
         command: String,
         executorKey: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        quiet: Boolean
     ): HiddenExecResult {
         val id = sshConnectionId
             ?: return HiddenExecResult(

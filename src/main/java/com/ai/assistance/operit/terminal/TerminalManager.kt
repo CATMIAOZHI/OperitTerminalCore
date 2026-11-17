@@ -1706,7 +1706,11 @@ $prootBindSetup
     suspend fun executeHiddenCommand(
         command: String,
         executorKey: String = "default",
-        timeoutMs: Long = 120000L
+        timeoutMs: Long = 120000L,
+        /** Run in this phone's Ubuntu even when the terminal is set to SSH. */
+        local: Boolean = false,
+        /** Keep the command and its output out of the log. */
+        quiet: Boolean = false
     ): HiddenExecResult {
         val initialized = initializeEnvironment()
         if (!initialized) {
@@ -1718,10 +1722,12 @@ $prootBindSetup
             )
         }
 
-        return getTerminalProvider().executeHiddenCommand(
+        val provider = if (local) getTerminalProvider(TerminalType.LOCAL) else getTerminalProvider()
+        return provider.executeHiddenCommand(
             command = command,
             executorKey = executorKey,
-            timeoutMs = timeoutMs
+            timeoutMs = timeoutMs,
+            quiet = quiet
         )
     }
 
