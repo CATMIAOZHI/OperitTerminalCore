@@ -6,22 +6,35 @@ import java.util.UUID
 class CommandProtocol {
     val token = UUID.randomUUID().toString().replace("-", "")
     private val helper = "__operit_result_$token"
+    private val startHelper = "__operit_start_$token"
     var installing = false
     var ready = false
     var activeToken: String? = null
     var envelope: String? = null
+    /**
+     * The shell printed the start marker of [activeToken]. Everything before it is the terminal
+     * echoing the submitted line, which for multi-line commands spans many lines and PS2 prompts.
+     */
+    var started = false
 
     fun bootstrap(): String =
         "$helper() { local rc=\$1; builtin printf '\\033]633;Operit;%s;%s\\007' \"\$2\" \"\$rc\"; return \"\$rc\"; }; " +
+            // Prints the start marker and hands the previous command's status on, so `$?` still works.
+            "$startHelper() { local rc=\$?; builtin printf '\\033]633;OperitStart;%s\\007' \"\$1\"; return \"\$rc\"; }; " +
             "$helper 0 '$token'"
 
     fun command(text: String): String {
         activeToken = UUID.randomUUID().toString().replace("-", "")
-        return "builtin eval -- '${text.replace("'", "'\\''")}'; $helper \"\$?\" '$activeToken'".also {
+        started = false
+        return ("$startHelper '$activeToken'; " +
+            "builtin eval -- '${text.replace("'", "'\\''")}'; $helper \"\$?\" '$activeToken'").also {
             envelope = it
         }
     }
 }
+
+/** OSC frame the shell prints right before running an automation command. */
+val COMMAND_START_FRAME = Regex("\u001b]633;OperitStart;([a-f0-9]+)(?:\u0007|\u001b\\\\)")
 
 /**
  * Frame complete escape sequences before rendering or parsing. PTY reads can split any sequence.

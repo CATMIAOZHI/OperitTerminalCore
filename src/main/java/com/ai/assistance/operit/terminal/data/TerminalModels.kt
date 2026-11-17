@@ -27,6 +27,8 @@ class CommandLifecycle {
     val protocol = com.ai.assistance.operit.terminal.CommandProtocol()
     val outputFramer = com.ai.assistance.operit.terminal.TerminalOutputFramer()
     var latestScreen: String? = null
+    /** [latestScreen] shows a full-screen program's display. */
+    var latestScreenFullscreen = false
 }
 
 /**

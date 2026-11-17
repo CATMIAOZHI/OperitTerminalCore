@@ -49,6 +49,15 @@ class OutputProcessor(
         session.commandLifecycle.outputFramer.feed(chunk) { frame ->
             val current = sessionManager.getSession(sessionId) ?: return@feed
             val protocol = current.commandLifecycle.protocol
+            val start = com.ai.assistance.operit.terminal.COMMAND_START_FRAME.matchEntire(frame)
+            if (start != null && current.automation) {
+                if (start.groupValues[1] == protocol.activeToken && !protocol.started) {
+                    protocol.started = true
+                    // Whatever is still buffered is the tail of the echoed input line.
+                    current.rawBuffer.clear()
+                }
+                return@feed
+            }
             val result = Regex("\u001b]633;Operit;([a-f0-9]+);([0-9]{1,3})(?:\u0007|\u001b\\\\)")
                 .matchEntire(frame)
             if (result != null && current.automation) {
@@ -57,6 +66,7 @@ class OutputProcessor(
                 if (token == protocol.token && protocol.installing) {
                     protocol.ready = true
                 } else if (token == protocol.activeToken && code != null) {
+                    protocol.started = true
                     publishScreen(sessionId, sessionManager)
                     val tail = AnsiUtils.stripAnsi(current.rawBuffer.toString())
                     current.rawBuffer.clear()
@@ -95,9 +105,13 @@ class OutputProcessor(
         val screen = session.ansiParser.getScreenContent().joinToString("\n") { row ->
             row.joinToString("") { it.char.toString() }.trimEnd()
         }.trimEnd().takeLast(12_000)
-        if (screen == session.commandLifecycle.latestScreen) return
+        val fullscreen = session.isFullscreen
+        if (screen == session.commandLifecycle.latestScreen &&
+            fullscreen == session.commandLifecycle.latestScreenFullscreen) return
         session.commandLifecycle.latestScreen = screen
-        onCommandExecutionEvent(CommandExecutionEvent(item.id, sessionId, "", false, screen = screen))
+        session.commandLifecycle.latestScreenFullscreen = fullscreen
+        onCommandExecutionEvent(CommandExecutionEvent(item.id, sessionId, "", false, screen = screen,
+            screenFullscreen = fullscreen))
     }
 
     private fun processText(
@@ -509,6 +523,8 @@ class OutputProcessor(
     ) {
         Log.d(TAG, "Detected interactive prompt: $cleanLine")
         val session = sessionManager.getSession(sessionId) ?: return
+        // A PS2 "> " while the input is still being echoed is not the command asking for input.
+        if (echoing(session)) return
         
         sessionManager.updateSession(sessionId) { session ->
             session.copy(
@@ -542,12 +558,20 @@ class OutputProcessor(
         return false
     }
 
+    /** An automation command whose start marker has not arrived: lines now are the echoed input. */
+    private fun echoing(session: TerminalSessionData): Boolean {
+        val protocol = session.commandLifecycle.protocol
+        return session.automation && protocol.activeToken != null && !protocol.started &&
+            session.commandLifecycle.cancellingCommandId == null
+    }
+
     private fun updateCommandOutput(
         sessionId: String,
         cleanLine: String,
         sessionManager: SessionManager
     ) {
         val session = sessionManager.getSession(sessionId) ?: return
+        if (echoing(session)) return
         val currentItem = session.currentExecutingCommand
 
         if (currentItem != null && currentItem.isExecuting) {
@@ -589,6 +613,7 @@ class OutputProcessor(
         sessionManager: SessionManager
     ) {
         val session = sessionManager.getSession(sessionId) ?: return
+        if (echoing(session)) return
         val builder = session.currentCommandOutput
         val lastExecutingItem = session.currentExecutingCommand
 
@@ -647,7 +672,8 @@ class OutputProcessor(
                 isCompleted = true,
                 terminationReason = if (session.commandLifecycle.cancellingCommandId == lastExecutingItem.id) "cancelled" else null,
                 exitCode = exitCode,
-                screen = session.commandLifecycle.latestScreen
+                screen = session.commandLifecycle.latestScreen,
+                screenFullscreen = session.commandLifecycle.latestScreenFullscreen
             ))
 
             // Clear the reference since command is no longer executing
@@ -720,7 +746,8 @@ class OutputProcessor(
                     isCompleted = true,
                     terminationReason = "session_closed",
                     sessionExitCode = sessionExitCode,
-                    screen = session.commandLifecycle.latestScreen
+                    screen = session.commandLifecycle.latestScreen,
+                    screenFullscreen = session.commandLifecycle.latestScreenFullscreen
                 )
             )
 

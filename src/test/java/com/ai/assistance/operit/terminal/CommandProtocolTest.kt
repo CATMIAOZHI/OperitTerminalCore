@@ -20,9 +20,20 @@ class CommandProtocolTest {
     @Test fun `command quoting does not interpolate command contents in outer shell`() {
         val protocol = CommandProtocol()
         val envelope = protocol.command("printf '%s' \"\$HOME\"\nfalse # tail")
-        assertTrue(envelope.startsWith("builtin eval -- 'printf '\\''%s'\\''"))
+        assertTrue(envelope.startsWith("__operit_start_${protocol.token} '${protocol.activeToken}'; "))
+        assertTrue(envelope.contains("; builtin eval -- 'printf '\\''%s'\\''"))
         assertFalse(envelope.contains('\u001b'))
         assertNotNull(protocol.activeToken)
+        assertFalse(protocol.started)
         assertTrue(protocol.bootstrap().contains("return \"\$rc\""))
+        assertTrue(protocol.bootstrap().contains("__operit_start_${protocol.token}() { local rc=\$?;"))
+    }
+
+    @Test fun `start marker is one frame that names the command`() {
+        val marker = "\u001b]633;OperitStart;abc123\u0007"
+        val frames = mutableListOf<String>()
+        TerminalOutputFramer().feed("echoed line\r\n$marker" + "output\r\n", frames::add)
+        assertTrue(frames.contains(marker))
+        assertEquals("abc123", COMMAND_START_FRAME.matchEntire(marker)!!.groupValues[1])
     }
 }

@@ -532,6 +532,7 @@ class TerminalManager private constructor(
             logLifecycle("session=${session.id} command=$commandId submitted")
             try {
                 session.commandLifecycle.latestScreen = null
+                session.commandLifecycle.latestScreenFullscreen = false
                 val protocol = session.commandLifecycle.protocol
                 val submitted = if (session.automation && protocol.ready) protocol.command(command) else command
                 val fullInput = "$submitted$TERMINAL_ENTER"

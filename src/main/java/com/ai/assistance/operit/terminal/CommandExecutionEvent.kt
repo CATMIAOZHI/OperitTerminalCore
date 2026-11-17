@@ -12,7 +12,9 @@ data class CommandExecutionEvent(
     val terminationReason: String? = null,
     val exitCode: Int? = null,
     val sessionExitCode: Int? = null,
-    val screen: String? = null
+    val screen: String? = null,
+    /** [screen] was taken while a full-screen program held the display, so it is not in the output. */
+    val screenFullscreen: Boolean = false
 ) : Parcelable
 
 @Parcelize
