@@ -566,12 +566,16 @@ class LocalTerminalProvider(
         return buildString {
             append("printf '%s\\n' '$BEGIN_MARKER_PREFIX$token'\n")
             append("__operit_hidden_script=\"\${TMPDIR:-/tmp}/operit_hidden_$tokenSuffix.sh\"\n")
+            // Readable by its owner only: a command may carry something other users must not see.
+            append("__operit_hidden_umask=\$(umask)\n")
+            append("umask 077\n")
             append("cat >\"\$__operit_hidden_script\" <<'$heredocMarker'\n")
             append(normalizedCommand)
             if (!normalizedCommand.endsWith("\n")) {
                 append('\n')
             }
             append("$heredocMarker\n")
+            append("umask \"\$__operit_hidden_umask\"\n")
             append("setsid /bin/bash --noprofile --norc \"\$__operit_hidden_script\" </dev/null &\n")
             append("__operit_hidden_pid=\$!\n")
             append("printf '%s:%s\\n' '$PID_MARKER_PREFIX$token' \"\$__operit_hidden_pid\"\n")
