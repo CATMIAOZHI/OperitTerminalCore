@@ -87,11 +87,17 @@ class SessionManager(private val terminalManager: TerminalManager) {
         try {
             sessionToClose.exitJob?.cancel()
             sessionToClose.readJob?.cancel()
-            sessionToClose.sessionWriter?.close()
         } catch (e: Exception) {
             Log.e("SessionManager", "Error cleaning up session streams", e)
         } finally {
+            // The process goes first: a write stuck in a full PTY holds the writer until it does.
             terminalManager.closeTerminalSession(sessionId)
+            sessionToClose.sessionWriter?.let { writer ->
+                Thread({
+                    runCatching { writer.close() }
+                        .onFailure { Log.e("SessionManager", "Error closing session input", it) }
+                }, "terminal-close-$sessionId").apply { isDaemon = true }.start()
+            }
         }
 
         terminalManager.onSessionClosed(sessionId)

@@ -344,7 +344,7 @@ class TerminalManager private constructor(
                     // Stop queue advancement before sending Ctrl+C. Do not let a delayed cancellation
                     // close the next command after the prompt returns.
                     session.commandLifecycle.cancellingCommandId = commandId
-                    runCatching { writeInputToKernel(session, "\u0003", "command-cancel") }
+                    queueInput(session, "\u0003", "command-cancel")
                     true
                 }
                 if (!running) return@withContext
@@ -425,6 +425,46 @@ class TerminalManager private constructor(
             TAG,
             "Sent terminal input to kernel [source=$source, sessionId=${session.id}]: '${escapeInputForLog(input)}'"
         )
+    }
+
+    private class PendingInput(val text: String, val source: String, val onFailure: ((Exception) -> Unit)?)
+
+    private val inputQueues = ConcurrentHashMap<String, kotlinx.coroutines.channels.Channel<PendingInput>>()
+
+    /**
+     * Writes [input] to the session's PTY in order, on one IO worker per session. A write blocks
+     * while the shell is behind, and the shell falls behind while its echo is unread; the output
+     * reader needs commandLifecycle to read it. So nothing may write while holding that lock: a long
+     * command (a big heredoc) would fill the PTY and both would wait for each other forever.
+     */
+    private fun queueInput(
+        session: TerminalSessionData,
+        input: String,
+        source: String,
+        onFailure: ((Exception) -> Unit)? = null,
+    ) {
+        // Checked and made under one lock with closeTerminalSession, so a closed session never gets a new queue.
+        val queue = synchronized(inputQueues) {
+            val open = sessionManager.getSession(session.id)
+            if (open == null || open.commandLifecycle.closed) return
+            inputQueues.getOrPut(session.id) {
+            kotlinx.coroutines.channels.Channel<PendingInput>(kotlinx.coroutines.channels.Channel.UNLIMITED).also { channel ->
+                val id = session.id
+                coroutineScope.launch(Dispatchers.IO) {
+                    for (item in channel) {
+                        // A session closed meanwhile takes nothing more.
+                        val current = sessionManager.getSession(id)?.takeIf { !it.commandLifecycle.closed } ?: continue
+                        try {
+                            writeInputToKernel(current, item.text, item.source)
+                        } catch (e: Exception) {
+                            item.onFailure?.invoke(e) ?: Log.e(TAG, "Error writing terminal input [${item.source}]", e)
+                        }
+                    }
+                }
+            }
+            }
+        }
+        queue.trySend(PendingInput(input, source, onFailure))
     }
 
     private fun escapeInputForLog(input: String): String {
@@ -536,8 +576,13 @@ class TerminalManager private constructor(
                 val protocol = session.commandLifecycle.protocol
                 val submitted = if (session.automation && protocol.ready) protocol.command(command) else command
                 val fullInput = "$submitted$TERMINAL_ENTER"
-                writeInputToKernel(session, fullInput, "command")
-                Log.d(TAG, "Sent command to PTY: $command")
+                queueInput(session, fullInput, "command") { e ->
+                    Log.e(TAG, "Error sending command", e)
+                    sessionManager.getSession(session.id)?.let { current ->
+                        synchronized(current.commandLifecycle) { finishClosedSession(current) }
+                    }
+                    closeSession(session.id)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending command", e)
                 finishClosedSession(session)
@@ -553,7 +598,7 @@ class TerminalManager private constructor(
             val session = sessionId?.let { sessionManager.getSession(it) } ?: return@launch
 
             try {
-                writeInputToKernel(session, input, "direct-input")
+                queueInput(session, input, "direct-input")
 
                 // 如果用户提供了交互式输入，则重置等待状态
                 if (session.isWaitingForInteractiveInput) {
@@ -575,7 +620,7 @@ class TerminalManager private constructor(
             try {
                 val currentSession = sessionId?.let { sessionManager.getSession(it) }
                 currentSession?.let {
-                    writeInputToKernel(it, "\u0003", "interrupt")
+                    queueInput(it, "\u0003", "interrupt")
                     Log.d(TAG, "Sent interrupt signal (Ctrl+C) to session ${it.id}")
                 }
             } catch (e: Exception) {
@@ -1581,6 +1626,7 @@ $prootBindSetup
 
     fun closeTerminalSession(sessionId: String) {
         sessionManager.getSession(sessionId)?.exitJob?.cancel()
+        synchronized(inputQueues) { inputQueues.remove(sessionId) }?.close()
         logLifecycle("session=$sessionId closing")
         closingSessions.add(sessionId)
         sessionProcesses[sessionId]?.let { process ->
