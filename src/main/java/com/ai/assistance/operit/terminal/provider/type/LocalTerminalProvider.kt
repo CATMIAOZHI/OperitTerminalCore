@@ -550,13 +550,22 @@ class LocalTerminalProvider(
     private fun buildVisibleSessionCommand(): Array<String> {
         val bash = File(binDir, "bash").absolutePath
         val startScript = "source \$HOME/common.sh && start_shell"
-        return arrayOf(bash, "-c", startScript)
+        return lowPriority(arrayOf(bash, "-c", startScript))
     }
 
     private fun buildHiddenExecStartupCommand(): Array<String> {
         val bash = File(binDir, "bash").absolutePath
         val startScript = "source \$HOME/common.sh && login_ubuntu '/bin/bash --noprofile --norc'"
-        return arrayOf(bash, "-c", startScript)
+        return lowPriority(arrayOf(bash, "-c", startScript))
+    }
+
+    /**
+     * Everything the terminal starts inherits a lower CPU priority, so the app's screens and Orbit
+     * come first while a build runs; on an idle phone the build is as fast as before.
+     */
+    private fun lowPriority(command: Array<String>): Array<String> {
+        val nice = File("/system/bin/nice")
+        return if (nice.canExecute()) arrayOf(nice.absolutePath, "-n", "10", *command) else command
     }
 
     private fun buildHiddenExecEnvelope(command: String, token: String): String {
